@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>クライアント実装ガイド - Fodpr</title>
+<style>
+  :root {
+    --bg: #0e1012;
+    --card: rgba(22, 26, 33, 0.72);
+    --border: rgba(255, 255, 255, 0.1);
+    --fg: #d7dde3;
+    --fg-dim: #9aa4af;
+    --fg-bright: #ffffff;
+    --accent: #7aa8ff;
+    --accent2: #7860ff;
+    --accent3: #00d2be;
+    --code-bg: rgba(0, 0, 0, 0.35);
+    --code-fg: #b9e6ff;
+    --radius: 16px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+    background-color: var(--bg);
+    background-image:
+      radial-gradient(60rem 60rem at 12% -10%, rgba(77, 160, 255, 0.18), transparent 60%),
+      radial-gradient(50rem 50rem at 110% 15%, rgba(120, 96, 255, 0.16), transparent 60%),
+      radial-gradient(70rem 70rem at 50% 120%, rgba(0, 210, 190, 0.12), transparent 60%);
+    color: var(--fg);
+    line-height: 1.7;
+    padding: 40px 16px 96px;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  header { margin-bottom: 40px; }
+  h1 { font-size: 1.9rem; color: var(--fg-bright); margin: 0 0 8px; letter-spacing: 0.01em; }
+  .sub { color: var(--fg-dim); margin: 0; font-size: 0.95rem; }
+  nav {
+    position: sticky; top: 12px; z-index: 10;
+    display: flex; flex-wrap: wrap; gap: 6px;
+    padding: 10px 12px; margin-bottom: 32px;
+    background: rgba(14, 16, 18, 0.82);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+  }
+  nav a { color: var(--fg-dim); text-decoration: none; font-size: 0.8rem; padding: 4px 12px; border-radius: 999px; transition: all 0.15s; }
+  nav a:hover { color: var(--fg-bright); background: rgba(255, 255, 255, 0.08); }
+  section { margin-bottom: 40px; scroll-margin-top: 70px; }
+  h2 {
+    font-size: 1.3rem; color: var(--fg-bright);
+    padding-bottom: 10px; margin: 0 0 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  h2 .n { color: var(--accent); margin-right: 8px; font-weight: 600; }
+  h3 { font-size: 1.05rem; color: var(--fg-bright); margin: 28px 0 10px; }
+  p { margin: 8px 0; }
+  ul, ol { margin: 8px 0 8px 1.3em; padding: 0; }
+  li { margin: 4px 0; }
+  a { color: var(--accent); }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 8px 12px; border: 1px solid var(--border); vertical-align: top; }
+  th { background: rgba(255, 255, 255, 0.06); color: var(--fg-bright); font-weight: 600; white-space: nowrap; }
+  code {
+    font-family: "SF Mono", ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+    font-size: 0.82em;
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 2px 6px;
+    border-radius: 6px;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 0.82rem;
+    line-height: 1.6;
+    margin: 12px 0;
+  }
+  pre code { background: none; padding: 0; color: var(--code-fg); }
+  .callout {
+    border: 1px solid rgba(122, 168, 255, 0.35);
+    background: rgba(122, 168, 255, 0.08);
+    border-radius: var(--radius);
+    padding: 12px 16px;
+    margin: 14px 0;
+    font-size: 0.9rem;
+  }
+  .callout.warn { border-color: rgba(255, 180, 80, 0.4); background: rgba(255, 180, 80, 0.08); }
+  .tag-pill { display: inline-block; background: rgba(255, 255, 255, 0.07); border: 1px solid var(--border); border-radius: 999px; padding: 1px 10px; margin: 2px; font-size: 0.78rem; color: var(--fg-dim); }
+  footer { margin-top: 48px; color: var(--fg-dim); font-size: 0.8rem; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>クライアント実装ガイド</h1>
+    <p class="sub">Fodpr に接続するクライアントを実装するためのプロトコル・投稿フォーマット・タグ仕様の詳細解説</p>
+  </header>
+
+  <nav>
+    <a href="#basic">基本形</a>
+    <a href="#trans">送信タイプ</a>
+    <a href="#wire">ワイヤプロトコル</a>
+    <a href="#post">投稿フォーマット</a>
+    <a href="#media">メディア</a>
+    <a href="#profile">プロフィール</a>
+    <a href="#react">リポスト・引用・リアクション</a>
+    <a href="#reply">リプライ(スレッド)</a>
+    <a href="#dedupe">dedupeKey</a>
+    <a href="#sign">署名</a>
+    <a href="#rest">REST API</a>
+    <a href="#relays">リレー一覧</a>
+  </nav>
+
+  <!-- ── 基本形 ── -->
+  <section id="basic">
+    <h2><span class="n">1.</span>イベントの基本形</h2>
+    <p>Fodpr の投稿(イベント)は以下のフィールドで構成されます。リレーは content の中身を解釈せず、transType ごとのストレージに追記保存します。</p>
+    <table>
+      <tr><th>フィールド</th><th>型</th><th>説明</th></tr>
+      <tr><td>pubkey</td><td>bytes (33)</td><td>投稿者の公開鍵(secp256k1 圧縮形式)</td></tr>
+      <tr><td>signature</td><td>bytes (64)</td><td>content に対する ECDSA 署名</td></tr>
+      <tr><td>transType</td><td>number</td><td>フォーマット種別(JSON / string / binary)</td></tr>
+      <tr><td>content</td><td>string</td><td>本文 / ペイロード</td></tr>
+      <tr><td>tags</td><td>string[]</td><td>補足情報(caption: / react: など)</td></tr>
+      <tr><td>createdAt</td><td>number</td><td>Unix 秒タイムスタンプ</td></tr>
+    </table>
+    <p>署名検証は <code>signature = sign(privkey, sha256(content))</code> です。詳細は <a href="#sign">署名</a> を参照。</p>
+  </section>
+
+  <!-- ── 送信タイプ ── -->
+  <section id="trans">
+    <h2><span class="n">2.</span>送信タイプ (TransType)</h2>
+    <p>イベントの content が何であるかを表す数値です。</p>
+    <table>
+      <tr><th>定数</th><th>値</th><th>用途</th></tr>
+      <tr><td>TransTypeAll</td><td>0x00</td><td>REQ(購読)でのみ使用</td></tr>
+      <tr><td>TransTypeJSON</td><td>0x01</td><td>content が UTF-8 の JSON(プロフィール)</td></tr>
+      <tr><td>TransTypeString</td><td>0x02</td><td>content が UTF-8 の文字列(テキスト投稿・リアクション・リポスト・リプライ)</td></tr>
+      <tr><td>TransTypeBinary</td><td>0x03</td><td>content が任意のバイト列(画像/動画/ファイル投稿)</td></tr>
+    </table>
+    <p>クライアントは受信イベントを以下のように振り分けます。</p>
+    <ul>
+      <li><code>TransTypeJSON</code> で content が JSON かつ <code>mode === "profile"</code> → プロフィール</li>
+      <li><code>TransTypeString</code> で <code>react:</code> タグ → リアクション、<code>reply:</code> タグ → リプライ、<code>repost:</code>/<code>quote:</code> タグ → リポスト/引用、それ以外 → テキスト投稿</li>
+      <li><code>TransTypeBinary</code> → メディア投稿</li>
+    </ul>
+  </section>
+
+  <!-- ── ワイヤプロトコル ── -->
+  <section id="wire">
+    <h2><span class="n">3.</span>ワイヤプロトコルと送信方法</h2>
+    <p>リレーとは<strong>バイナリ WebSocket フレーム</strong>で通信します。テキストフレームは UTF-8 エンコードのため、公開鍵や署名のような任意バイト列(0x80 以上)をそのまま運べないためです。</p>
+
+    <h3>3.1 パケット種別</h3>
+    <table>
+      <tr><th>種別バイト</th><th>メッセージ</th><th>方向</th></tr>
+      <tr><td>0x01</td><td>EVENT(イベント投稿)</td><td>クライアント → サーバー</td></tr>
+      <tr><td>0x02</td><td>REQ(購読要求)</td><td>クライアント → サーバー</td></tr>
+      <tr><td>0x03</td><td>DEL(削除要求)</td><td>クライアント → サーバー</td></tr>
+      <tr><td>0x81</td><td>PUSH(イベント配信)</td><td>サーバー → クライアント</td></tr>
+    </table>
+
+    <h3>3.2 イベント本体のバイナリレイアウト</h3>
+    <p>すべてビッグエンディアンです。</p>
+    <pre><code>transType(2) | createdAt(8) | pubkey(33) | tagCount(2) | (tagLen(2) | tag) * tagCount | contentLen(4) | content | signature(64)</code></pre>
+    <ul>
+      <li><code>createdAt</code>: Unix タイムスタンプ(秒, uint64)</li>
+      <li><code>pubkey</code>: 圧縮公開鍵 33 バイト</li>
+      <li><code>tags</code>: UTF-8 文字列の配列</li>
+      <li><code>content</code>: UTF-8 バイト列(TransTypeBinary でもバイナリのまま配信)</li>
+      <li><code>signature</code>: content の SHA-256 に対する ECDSA 署名 64 バイト</li>
+    </ul>
+
+    <h3>3.3 投稿パケット (EVENT)</h3>
+    <p><code>encodeEvent</code> の出力は「本体」なので、送信時は先頭に種別バイト <code>0x01</code> を付けます。</p>
+    <pre><code>const payload = Protocol.encodeEvent(event);       // イベント本体
+const frame = new Uint8Array(1 + payload.length);  // 種別バイト + 本体
+frame[0] = 0x01;                                   // MsgTypeEvent
+frame.set(payload, 1);
+ws.send(frame.buffer);                             // バイナリフレームで送信</code></pre>
+
+    <h3>3.4 購読 (REQ)</h3>
+    <p>接続確立後に一度 REQ を送ると、保存済みイベントが PUSH され、以後の新着も PUSH されます。</p>
+    <pre><code>MsgTypeReq(1) | subIdLen(2) | subId | transType(2) | tagKeyLen(2) | tagKey | tagValLen(2) | tagVal</code></pre>
+    <pre><code>const req = {
+  subId: 'sub_web_' + Date.now(),
+  transType: TransTypeAll, // すべてのタイプを購読
+  tagKey: '',
+  tagVal: '',
+};
+ws.send(Protocol.encodeReq(req)); // 先頭に 0x02 を含む</code></pre>
+    <p>タグ絞り込みも可能です。例: <code>caption:</code> タグを持つメディアだけを購読する場合、<code>tagKey = "caption"</code> を指定します。</p>
+  </section>
+
+  <!-- ── 投稿フォーマット ── -->
+  <section id="post">
+    <h2><span class="n">4.</span>投稿フォーマット</h2>
+
+    <h3>4.1 テキスト投稿 (TransTypeString)</h3>
+    <p><code>transType = 0x02</code>、<code>content = 本文</code>、<code>tags = []</code>。署名対象は content の UTF-8 バイト列です。</p>
+    <pre><code>const content = '今日もにゃんこ日和。';
+const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(content));
+const event = {
+  transType: TransTypeString,
+  createdAt: Math.floor(Date.now() / 1000),
+  pubkey: pubkeyBytes,      // 33 バイト圧縮公開鍵
+  tags: [],
+  content,
+  signature: CryptoUtils.hexToBytes(sig),
+};
+sendEventToRelay(event);    // Protocol.encodeEvent + 0x01 前置 + バイナリ送信</code></pre>
+
+    <h3>4.2 プロフィール投稿 (TransTypeJSON)</h3>
+    <p><code>mode: "profile"</code> を必須とします。クライアントはこれでプロフィールと判定します。</p>
+    <pre><code>{
+  "mode": "profile",
+  "name": "表示名 (必須)",
+  "about": "自己紹介 (省略可)",
+  "picture": "アイコン画像の直リンク URL (省略可)"
+}</code></pre>
+    <p>表示には公開鍵ごとに <strong>createdAt が最大のプロフィールを 1 件</strong>だけ採用します。つまりプロフィールは「上書き」です。</p>
+    <p><code>picture</code> は直リンク URL です。同一オリジンなら <code>/media/file/&lt;name&gt;</code> の相対パス、別オリジンのクライアントからも表示したい場合は絶対 URL を入れてください。</p>
+
+    <h3>4.3 メディア投稿 (TransTypeBinary)</h3>
+    <p>詳細は <a href="#media">メディア</a> を参照してください。</p>
+  </section>
+
+  <!-- ── メディア ── -->
+  <section id="media">
+    <h2><span class="n">5.</span>メディア投稿 (画像/動画/ファイル)</h2>
+
+    <h3>5.1 content の形式</h3>
+    <p>content は <code>&lt;mime&gt;:&lt;base64&gt;</code> 形式です(区切りはコロン)。</p>
+    <pre><code>&lt;mime&gt;:&lt;base64&gt;
+例: image/png:iVBORw0KGgoAAAANSUhEUg...</code></pre>
+    <ul>
+      <li><code>&lt;mime&gt;</code>: data URL の MIME 部分(<code>data:image/png;base64,XXXX</code> の <code>image/png</code>)</li>
+      <li><code>&lt;base64&gt;</code>: data URL の base64 本体(区切りは <strong>コロン</strong>。 <code>;base64,</code> ではない)</li>
+    </ul>
+    <p>クライアントの描画は <code>/^(?:img:)?([^:;,]+)(?:;base64)?[,:](.+)$/s</code> でパースし、mime が <code>video/</code> で始まれば動画、それ以外は画像/ダウンロードリンクとして表示します。</p>
+
+    <h3>5.2 tags</h3>
+    <table>
+      <tr><th>タグ</th><th>内容</th></tr>
+      <tr><td><code>caption:&lt;文字列&gt;</code></td><td>キャプション(無ければ元ファイル名)。カードの alt / 説明文</td></tr>
+      <tr><td><code>filename:&lt;文字列&gt;</code></td><td>元ファイル名(プレビューやダウンロード名)</td></tr>
+      <tr><td><code>mediatype:&lt;image|video|file&gt;</code></td><td>種別(動画かどうかの判定)</td></tr>
+    </table>
+
+    <h3>5.3 送信コード</h3>
+    <pre><code>const dm = /^data:([^;]+);base64,(.+)$/s.exec(mediaDataUrl);
+const mime = dm[1];
+const base64 = dm[2];
+const mediaContent = `${mime}:${base64}`;
+const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(mediaContent));
+const event = {
+  transType: TransTypeBinary,
+  createdAt: Math.floor(Date.now() / 1000),
+  pubkey: pubkeyBytes,
+  tags: [
+    `caption:${caption}`,
+    `filename:${filename}`,
+    `mediatype:${mediaType}`, // "image" | "video" | "file"
+  ],
+  content: mediaContent,
+  signature: CryptoUtils.hexToBytes(sig),
+};
+sendEventToRelay(event);</code></pre>
+
+    <h3>5.4 圧縮と上限</h3>
+    <ul>
+      <li>画像: 上限 12MB。長辺 1600px までリサイズ+再エンコード</li>
+      <li>動画: 上限 50MB。data URL 化して投稿、サムネイルを抽出</li>
+      <li>その他ファイル: 上限 12MB。そのまま data URL 化</li>
+    </ul>
+    <div class="callout warn">メディア本体はイベントの content に base64 で入るため、リレーの保存サイズもその分大きくなります。</div>
+  </section>
+
+  <!-- ── プロフィール ── -->
+  <section id="profile">
+    <h2><span class="n">6.</span>プロフィール画像のアップロード</h2>
+    <p>プロフィールの <code>picture</code> に使う直リンク URL は、同一オリジンのメディアサーバーで発行できます。</p>
+    <pre><code>POST /media/upload        (Content-Type: image/png で画像本体を POST)
+→ 200 {"url":"/media/file/&lt;32hex&gt;.png","mime":"image/png","isVideo":false,"isImage":true}
+
+GET  /media/file/&lt;name&gt;   保存済み画像の配信</code></pre>
+    <pre><code>const res = await fetch('/media/upload', {
+  method: 'POST',
+  headers: { 'Content-Type': blob.type },
+  body: blob,
+});
+const { url } = await res.json(); // 例: "/media/file/abcd1234....png"
+// この url をプロフィール JSON の picture に入れて TransTypeJSON で投稿する</code></pre>
+  </section>
+
+  <!-- ── リポスト・引用・リアクション ── -->
+  <section id="react">
+    <h2><span class="n">7.</span>リポスト・引用・リアクション</h2>
+    <p>いずれも TransTypeString で送られる補助イベントです。対象イベントは <a href="#dedupe">dedupeKey</a> で指定します。</p>
+    <table>
+      <tr><th>種別</th><th>content</th><th>tags</th></tr>
+      <tr><td>リアクション</td><td>絵文字(例 <code>❤️</code>)</td><td><code>react:&lt;dedupeKey&gt;</code></td></tr>
+      <tr><td>リポスト</td><td>空文字</td><td><code>repost:&lt;dedupeKey&gt;</code></td></tr>
+      <tr><td>引用リポスト</td><td>自分のコメント</td><td><code>quote:&lt;dedupeKey&gt;</code></td></tr>
+    </table>
+<pre><code>// リアクション
+const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode('❤️'));
+sendSignedEvent(TransTypeString, '❤️', sig, [`react:${dedupeKeyOfTarget}`]);
+
+// リポスト (content が空でも署名対象は空文字の UTF-8 バイト列)
+const sig2 = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(''));
+sendSignedEvent(TransTypeString, '', sig2, [`repost:${dedupeKeyOfTarget}`]);
+
+// リプライ (content = 返信本文、署名対象は本文の UTF-8 バイト列)
+const sig3 = await CryptoUtils.signMessage(privKey, new TextEncoder().encode('返信本文'));
+sendSignedEvent(TransTypeString, '返信本文', sig3, [`reply:${dedupeKeyOfTarget}`]);</code></pre>
+
+<h3>7.2 リプライ / スレッド表示</h3>
+<p>リプライは <code>reply:&lt;dedupeKey&gt;</code> タグの付いた TransTypeString です。対象イベントの直下に「返信 n 件」としてスレッド表示され、返信の返信も再帰的に表示されます。自分の投稿の右上にある <code>…</code> (メニュー) ボタンからも投稿を削除できます。</p>
+<ul>
+  <li>対象イベントが未取得の場合は「返信先が見つからない投稿」欄にフォールバック表示されます</li>
+  <li>自分のプロフィール画面の投稿一覧には、自分のリプライも含めて表示されます</li>
+  <li>リプライの送信はコンポーザの「返信先」バナーから行えます(テキストのみ、Ctrl/Cmd+Enter で投稿)</li>
+</ul>
+<div class="callout warn">リレーは過去に PUSH 済みのイベントを取り消しません。そのためクライアントは削除済みイベントの dedupeKey をローカルで記憶し、フィードから除外しています。</div>
+</section>
+
+  <!-- ── dedupeKey ── -->
+  <section id="dedupe">
+    <h2><span class="n">8.</span>dedupeKey(イベントの一意キー)</h2>
+    <p>重複排除に使うキーです。イベントの署名まで含めることで「同一秒に複数投稿」しても重複して弾かないようにしています。</p>
+    <pre><code>dedupeKey = pubkeyHex + ":" + transType + ":" + createdAt + ":" + signatureHex</code></pre>
+    <p>リポスト / 引用 / リアクションの対象指定(タグの値)にもこの文字列を使います。</p>
+    <p>投稿削除(DEL)時には <code>createdAt</code> と content の SHA-256 ハッシュ(<code>contentHash</code>)を指定します。</p>
+  </section>
+
+  <!-- ── 署名 ── -->
+  <section id="sign">
+    <h2><span class="n">9.</span>署名</h2>
+    <p>署名はすべて ECDSA(secp256k1、compact 形式 64 バイト)です。<code>signMessage</code> は <strong>content の SHA-256 ダイジェスト</strong>に対して署名します。</p>
+    <div class="callout">署名対象のバイト列は必ず <code>new TextEncoder().encode(content)</code> を使うこと。サーバー側の検証と一致するために重要です。</div>
+    <pre><code>// 鍵生成
+const privKey = CryptoUtils.generatePrivateKey();          // 64 桁 HEX
+const pubkey  = CryptoUtils.getPublicKey(privKey);         // 圧縮公開鍵 HEX
+
+// 署名 (content の SHA-256 に署名)
+const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(content));
+
+// 検証
+const ok = await CryptoUtils.verifySignature(pubkey, new TextEncoder().encode(content), sig);</code></pre>
+  </section>
+
+  <!-- ── REST API ── -->
+  <section id="rest">
+    <h2><span class="n">10.</span>REST API(サーバー側)</h2>
+    <p>クライアントから直接リレーへ接続できない環境向けに、REST API も提供されています。<code>/api/docs</code> に詳しい仕様があります。</p>
+    <table>
+      <tr><th>エンドポイント</th><th>メソッド</th><th>説明</th></tr>
+      <tr><td><code>/api/keygen</code></td><td>POST</td><td>秘密鍵を新規生成</td></tr>
+      <tr><td><code>/api/note</code></td><td>POST</td><td>テキスト投稿(tags で reply: / quote: / react: / repost: を指定可能)</td></tr>
+      <tr><td><code>/api/media</code></td><td>POST</td><td>メディア投稿(JSON base64 / multipart 両対応)</td></tr>
+      <tr><td><code>/api/delete</code></td><td>POST</td><td>投稿削除(contentHash または content 指定)</td></tr>
+      <tr><td><code>/api/events</code></td><td>GET</td><td>購読済みイベントの取得(limit/since/after/transType)</td></tr>
+      <tr><td><code>/api/health</code></td><td>GET</td><td>ヘルスチェック</td></tr>
+      <tr><td><code>/api/docs</code></td><td>GET</td><td>API ドキュメント(HTML)</td></tr>
+    </table>
+    <pre><code># テキスト投稿の例
+POST /api/note
+Content-Type: application/json
+
+{
+  "privKey": "&lt;64桁HEXの秘密鍵&gt;",
+  "content": "こんにちは",
+  "tags": []
+}</code></pre>
+  </section>
+
+  <!-- ── リレー一覧 ── -->
+  <section id="relays">
+    <h2><span class="n">11.</span>リレー一覧の保存先</h2>
+    <p>ブラウザクライアントのリレー一覧は localStorage に保存されます。</p>
+    <pre><code>localStorage.fodpr_relays = JSON.stringify(["wss://example.com/", "wss://fodpr.yoinekodo.jp/"]) // 複数可</code></pre>
+  </section>
+
+  <footer>Fodpr クライアント実装ガイド · 本ドキュメントはサーバー上に静的に配信されています</footer>
+</div>
+</body>
+</html>

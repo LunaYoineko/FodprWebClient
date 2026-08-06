@@ -18,7 +18,7 @@
 |---|---|---|
 | `TransTypeAll` | `0x00` | REQ(購読)でのみ使用 |
 | `TransTypeJSON` | `0x01` | content が UTF-8 の JSON(プロフィール) |
-| `TransTypeString` | `0x02` | content が UTF-8 の文字列(テキスト投稿・リアクション・リポスト) |
+| `TransTypeString` | `0x02` | content が UTF-8 の文字列(テキスト投稿・リアクション・リポスト・リプライ) |
 | `TransTypeBinary` | `0x03` | content が任意のバイト列(画像/動画/ファイル投稿) |
 
 ### 1.2 イベントの分類 (FodprWebClient 側)
@@ -26,8 +26,12 @@
 クライアントは受信イベントを `splitEvents` (`src/App.tsx`) で以下のように振り分ける。
 
 - `TransTypeJSON` で content が JSON かつ `mode === "profile"` → **プロフィール**
-- `TransTypeString` で `react:` タグ → リアクション、`repost:` / `quote:` タグ → リポスト/引用、それ以外 → **テキスト投稿**
+- `TransTypeString` で `react:` タグ → リアクション、`reply:` タグ → リプライ、`repost:` / `quote:` タグ → リポスト/引用、それ以外 → **テキスト投稿**
 - `TransTypeBinary` → **メディア投稿**
+
+リプライは単独の投稿カードとしてはタイムラインに並ばず、対象イベントの下にスレッドとして表示される
+(`ReplyThread` / `ReplyCard`)。対象イベントがまだ未取得の場合は「返信先が見つからない投稿」欄に
+フォールバック表示される。
 
 ### 1.3 イベントの一意キー (dedupeKey)
 
@@ -37,7 +41,7 @@
 dedupeKey = pubkeyHex + ":" + transType + ":" + createdAt + ":" + signatureHex
 ```
 
-リポスト/引用/リアクションの対象指定(タグの値)にもこの文字列を使う。
+リポスト/引用/リアクション/リプライの対象指定(タグの値)にもこの文字列を使う。
 
 ### 1.4 署名
 
@@ -187,7 +191,7 @@ ws.send(frame.buffer);
 ### 4.1 形式
 
 - `content`: 投稿テキストそのもの (UTF-8)
-- `tags`: なし(リアクション/リポスト/引用でなければ)
+- `tags`: なし(リアクション/リポスト/引用/リプライでなければ)
 - 署名対象: `content` の UTF-8 バイト列
 
 ### 4.2 送信コード (FodprWebClient の `postNote` 相当)
@@ -287,6 +291,7 @@ sendEventToRelay(event);
 | リアクション | 絵文字(例 `❤️`) | `react:<dedupeKey>` | TransTypeString |
 | リポスト | 空文字 | `repost:<dedupeKey>` | TransTypeString |
 | 引用リポスト | 自分のコメント | `quote:<dedupeKey>` | TransTypeString |
+| リプライ | 返信本文 | `reply:<dedupeKey>` | TransTypeString |
 
 ```ts
 // リアクション
@@ -296,7 +301,19 @@ sendSignedEvent(TransTypeString, '❤️', sig, [`react:${dedupeKeyOfTarget}`]);
 // リポスト (content は空文字でも署名対象は空文字の UTF-8 バイト列)
 const sig2 = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(''));
 sendSignedEvent(TransTypeString, '', sig2, [`repost:${dedupeKeyOfTarget}`]);
+
+// リプライ (content は返信本文。署名対象は本文の UTF-8 バイト列)
+const sig3 = await CryptoUtils.signMessage(privKey, new TextEncoder().encode('返信本文'));
+sendSignedEvent(TransTypeString, '返信本文', sig3, [`reply:${dedupeKeyOfTarget}`]);
 ```
+
+### 6.1 リプライの表示 (FodprWebClient 側)
+
+- 分類: `splitEvents` で `reply:` タグを持つ TransTypeString を `replies` に振り分ける。
+- スレッド化: `replyMap` (`Map<dedupeKey, FodprEvent[]>`) で対象ごとに束ね、
+  `TimelineCard`(トップレベルのみ)の直下に `ReplyThread` として表示する。返信の返信は再帰的に表示される(深さ上限 4)。
+- 返信カードは「◯◯ への返信」の宛先表示と、リアクション/返信/削除のアクションを持つ。
+- 自分のプロフィール画面では、自分の投稿一覧にリプライも含めて表示される。
 
 ---
 
@@ -330,13 +347,51 @@ const { url } = await res.json(); // 例: "/media/file/abcd1234....png"
 
 1. リレー起動: `docker start fodprrelay`(ポート 8000)
 2. dev サーバー起動: `pnpm dev --port 5199`
-3. テストスイート実行: `/tmp/opencode/pwtest/*.mjs`(playwright)
+3. テストスイート実行: `cd /tmp/opencode/pwtest && node <name>.mjs [url]`(playwright)
    - テキスト: `e2e.mjs` / `feed.mjs`
    - メディア: `compress.mjs` / `media.mjs`
-   - プロフィール: `profile_img.mjs`
+   - プロフィール: `profile_img.mjs` / `debug_profile2.mjs`
    - リポスト/引用: `repost_quote.mjs`
-   - リアルタイム: `realtime.mjs`
-4. 本番配信: `pnpm build` → `dist/` を `/var/www/fodpr` へ同期(`node /var/www/fodpr-server.js` が :8088 で配信)
+   - リプライ: `reply.mjs` / `reply_reload.mjs` / `reply_delete_reply.mjs`
+   - リプライ(モバイル+削除): `reply_mobile_delete.mjs`
+   - 削除サーバー永続化: `delete_persist.mjs`
+4. 本番配信: `pnpm build` → `dist/` を `/var/www/fodpr` へ同期
+
+## 8.1 本番サーバーの起動・停止・デプロイ
+
+- サーバー実行ファイル: `api/server.mjs` (静的配信 + REST API + リレーブリッジ)
+- 起動(env はプロジェクト直下 `.env` か環境に設定。過去の起動例)
+
+```sh
+export FODPR_STATIC_ROOT=/var/www/fodpr
+export FODPR_RELAY_URL=ws://localhost:8000/
+export FODPR_MEDIA_DIR=/root/FodprWebClient/media
+export FODPR_API_PORT=8088
+nohup node /root/FodprWebClient/api/server.mjs > /tmp/fodpr-api.log 2>&1 &
+
+# 停止
+pkill -f 'api/server.mjs'   # または: kill $(pgrep -f 'api/server.mjs')
+```
+
+- デプロイ(静的ファイル同期)
+
+```sh
+pnpm build
+# dist/ の内容を静的ルートへ上書き同期
+cp -r dist/assets /var/www/fodpr/assets
+cp dist/index.html /var/www/fodpr/index.html
+cp public/docs.html /var/www/fodpr/docs.html
+# APIドキュメントは api/docs.html を直接編集 (サーバーが /api/docs として配信)
+```
+
+- 起動確認
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' https://fodpr.yoinekodo.jp/
+curl -s -o /dev/null -w '%{http_code}\n' https://fodpr.yoinekodo.jp/docs.html
+curl -s -o /dev/null -w '%{http_code}\n' https://fodpr.yoinekodo.jp/api/docs
+curl -s -o /dev/null -w '%{http_code}\n' https://fodpr.yoinekodo.jp/api/health
+```
 
 ---
 

@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fodpr REST API ドキュメント</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #14171e;
+    --border: #232838;
+    --text: #e6e8ee;
+    --muted: #9aa2b1;
+    --accent: #7c5cff;
+    --accent2: #4fd1c5;
+    --red: #f56565;
+    --green: #68d391;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Kaku Gothic ProN", "Noto Sans JP", Meiryo, sans-serif;
+    line-height: 1.7;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 24px 20px 80px; }
+  header.top { border-bottom: 1px solid var(--border); padding: 16px 0 20px; margin-bottom: 24px; }
+  header.top h1 { margin: 0; font-size: 1.6rem; }
+  header.top p { color: var(--muted); margin: 6px 0 0; }
+  .base-url {
+    display: inline-block; margin-top: 12px; padding: 6px 12px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    font-family: var(--mono); font-size: 0.85rem; color: var(--accent2);
+  }
+  h2 {
+    margin: 40px 0 12px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--border); font-size: 1.25rem;
+  }
+  h3 { margin: 26px 0 8px; font-size: 1.05rem; }
+  p, li { color: #d4d8e2; }
+  code {
+    font-family: var(--mono); font-size: 0.85em;
+    background: #1a1e29; border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px;
+    color: #e2b8ff;
+  }
+  pre {
+    background: #10131b; border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; overflow-x: auto; margin: 10px 0;
+  }
+  pre code { background: none; border: none; padding: 0; color: #c9d4e8; font-size: 0.82rem; line-height: 1.6; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--panel); color: var(--muted); font-weight: 600; }
+  .endpoint {
+    border: 1px solid var(--border); border-radius: 12px; background: var(--panel);
+    padding: 14px 16px; margin: 14px 0;
+  }
+  .endpoint .method {
+    display: inline-block; font-family: var(--mono); font-weight: 700; font-size: 0.8rem;
+    border-radius: 6px; padding: 2px 8px; margin-right: 8px;
+  }
+  .method.get { background: #0f3d3a; color: var(--accent2); }
+  .method.post { background: #2b2140; color: #b79cff; }
+  .endpoint .path { font-family: var(--mono); font-weight: 600; }
+  .endpoint .desc { color: var(--muted); margin-top: 6px; font-size: 0.92rem; }
+  .note {
+    border-left: 3px solid var(--accent2); background: rgba(79, 209, 197, 0.07);
+    padding: 10px 14px; border-radius: 0 8px 8px 0; margin: 14px 0; font-size: 0.92rem;
+  }
+  .warn {
+    border-left: 3px solid var(--red); background: rgba(245, 101, 101, 0.08);
+    padding: 10px 14px; border-radius: 0 8px 8px 0; margin: 14px 0; font-size: 0.92rem;
+  }
+  .ok { color: var(--green); }
+  .bad { color: var(--red); }
+  a { color: var(--accent2); }
+  ul { padding-left: 22px; }
+  .scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>Fodpr REST API</h1>
+    <p>Bot やスクリプトから Fodpr のタイムラインに投稿・削除・購読(取得)するための HTTP API。</p>
+    <span class="base-url">ベース URL: https://fodpr.yoinekodo.jp/api</span>
+  </header>
+
+  <div class="note">
+    すべてのリクエスト・レスポンスは JSON(UTF-8)です。POST は <code>Content-Type: application/json</code> を
+    指定してください(メディア投稿の <code>multipart/form-data</code> 形式も対応)。
+    成功時は <code>{"ok": true, ...}</code>、失敗時は <code>{"ok": false, "error": "..."}</code> と HTTP ステータスを返します。
+  </div>
+
+  <h2>秘密鍵について</h2>
+  <p>
+    Fodpr では <strong>secp256k1</strong> の秘密鍵(64 桁の HEX)を使って投稿に署名します。
+    この API では <code>privKey</code> フィールドに秘密鍵を渡すだけで、サーバー側で署名と送信を行います。
+  </p>
+  <div class="warn">
+    <strong>秘密鍵は他人に教えないでください。</strong>鍵が漏れるとそのアカウントのすべての投稿・削除ができてしまいます。
+    API は HTTPS(Cloudflare)経由で暗号化されているため通信中の盗聴は防げますが、スクリプトの保存先には十分注意してください。
+  </div>
+
+  <h2>エンドポイント一覧</h2>
+  <table>
+    <tr><th>メソッド</th><th>パス</th><th>説明</th></tr>
+    <tr><td>GET</td><td><code>/api/docs</code></td><td>このドキュメント</td></tr>
+    <tr><td>GET</td><td><code>/api/health</code></td><td>サーバーとリレーの状態確認</td></tr>
+    <tr><td>POST</td><td><code>/api/keygen</code></td><td>秘密鍵の新規作成</td></tr>
+    <tr><td>POST</td><td><code>/api/note</code></td><td>テキスト投稿(tagger でリアクション/引用/リポスト/リプライも可)</td></tr>
+    <tr><td>POST</td><td><code>/api/media</code></td><td>メディア投稿(画像/動画/ファイル)</td></tr>
+    <tr><td>POST</td><td><code>/api/delete</code></td><td>投稿の削除</td></tr>
+    <tr><td>GET</td><td><code>/api/events</code></td><td>タイムラインの取得(購読)</td></tr>
+  </table>
+
+  <h2>1. 秘密鍵の作成 <span class="method post">POST</span><code>/api/keygen</code></h2>
+  <p>新規の秘密鍵と公開鍵を生成します。初めて使うときはまずここで鍵を作って保存してください。</p>
+  <pre><code>curl -X POST https://fodpr.yoinekodo.jp/api/keygen</code></pre>
+  <p>レスポンス例:</p>
+  <pre><code>{
+  "ok": true,
+  "privKey": "f0d4c1a2...64桁のHEX...",
+  "pubkey": "02c0ffee...66桁のHEX(圧縮公開鍵)..."
+}</code></pre>
+  <table>
+    <tr><th>フィールド</th><th>説明</th></tr>
+    <tr><td><code>privKey</code></td><td>秘密鍵(64 桁 HEX)。次回以降の投稿に使うので安全に保存してください。</td></tr>
+    <tr><td><code>pubkey</code></td><td>公開鍵(66 桁 HEX、圧縮形式 33 バイト)。アカウントの ID にあたります。</td></tr>
+  </table>
+
+  <h2>2. テキスト投稿 <span class="method post">POST</span><code>/api/note</code></h2>
+  <p>テキストをタイムラインに投稿します。</p>
+  <div class="endpoint">
+    <span class="method post">POST</span><span class="path">/api/note</span>
+    <div class="desc">リクエスト本文(JSON)</div>
+    <pre><code>{
+  "privKey": "64桁のHEX秘密鍵",
+  "content": "こんにちは、Fodpr の世界!",
+   "tags": [],            // 任意。追加タグ(例: ["react:<key>","quote:<key>","repost:<key>","reply:<key>"])
+   "quote": "",            // 任意。引用リポストする対象の dedupeKey
+   "reply": ""            // 任意。返信する対象の dedupeKey(自分のコメントを content に入れる)
+}</code></pre>
+    <div class="desc">レスポンス例</div>
+    <pre><code>{
+  "ok": true,
+  "message": "OK: Event accepted",
+  "event": {
+    "dedupeKey": "pubkey:2:1785981600:署名...",
+    "transType": 2,
+    "createdAt": 1785981600,
+    "pubkey": "02...",
+    "tags": [],
+    "content": "こんにちは、Fodpr の世界!",
+    "signature": "..."
+  }
+}</code></pre>
+  </div>
+  <p>
+    <code>event.dedupeKey</code> はこの投稿を一意に識別するキーです。後で削除したいときや、
+    他のユーザーが「引用」「リアクション」するときに使う ID です。投稿時は必ず保存しておきましょう。
+  </p>
+
+  <h2>3. メディア投稿 <span class="method post">POST</span><code>/api/media</code></h2>
+  <p>画像・動画・ファイルを添付して投稿します。リレーの仕様上、ファイルは base64 にしてイベントに埋め込まれます。</p>
+  <h3>3a. JSON(base64)で送る場合</h3>
+  <div class="endpoint">
+    <span class="method post">POST</span><span class="path">/api/media</span>
+    <pre><code>{
+  "privKey": "64桁のHEX秘密鍵",
+  "mime": "image/png",
+  "data": "iVBORw0KGgoAAAANSUhEUg... (base64エンコードしたファイル本体)",
+  "caption": "かわいい猫の写真",
+  "filename": "cat.png"
+}</code></pre>
+  </div>
+  <h3>3b. multipart/form-data で送る場合(curl 推奨)</h3>
+  <pre><code>curl -X POST https://fodpr.yoinekodo.jp/api/media \
+  -F "privKey=64桁のHEX秘密鍵" \
+  -F "caption=かわいい猫の写真" \
+  -F "file=@cat.png;type=image/png"</code></pre>
+  <table>
+    <tr><th>フィールド</th><th>説明</th></tr>
+    <tr><td><code>privKey</code></td><td>秘密鍵(必須)</td></tr>
+    <tr><td><code>mime</code> / <code>data</code></td><td>JSON 形式のとき必須。MIME タイプと base64 データ</td></tr>
+    <tr><td><code>file</code></td><td>multipart 形式のとき必須。ファイル本体</td></tr>
+    <tr><td><code>caption</code></td><td>任意。画像の説明文(タイムラインで表示)</td></tr>
+    <tr><td><code>filename</code></td><td>任意。元ファイル名(省略時は <code>file</code>)</td></tr>
+  </table>
+  <p>対応形式と上限: 画像 <code>image/jpeg, png, webp, gif</code> 12MB まで、動画 <code>video/mp4, webm, mov, avi, mkv</code> 50MB まで。</p>
+
+  <h2>4. 投稿の削除 <span class="method post">POST</span><code>/api/delete</code></h2>
+  <p>自分の投稿だけを削除できます。投稿したときの <code>createdAt</code> と、本文の SHA-256(<code>contentHash</code>) が必要です。</p>
+  <div class="endpoint">
+    <span class="method post">POST</span><span class="path">/api/delete</span>
+    <pre><code>{
+  "privKey": "64桁のHEX秘密鍵",
+  "createdAt": 1785981600,          // 投稿時の event.createdAt(Unix秒)
+  "contentHash": "64桁HEX",         // 本文の SHA-256(または下の content でも可)
+  "transType": 2                    // 任意(省略時はすべてのタイプから探す)
+}</code></pre>
+  </div>
+  <p>
+    <code>contentHash</code> の代わりに削除する本文そのものを <code>content</code> フィールドで渡すこともできます
+    (サーバーが SHA-256 を計算します)。レスポンス例:
+  </p>
+  <pre><code>{ "ok": true, "message": "OK: 1 event(s) deleted", "deleted": 1 }</code></pre>
+  <div class="warn">削除はサーバー側で永久に行われます。取り消しはできません。</div>
+
+  <h2>5. タイムラインの取得(購読) <span class="method get">GET</span><code>/api/events</code></h2>
+  <p>
+    リレーの購読(REQ All)を常時受信しているため、そのまま <code>GET /api/events</code> を呼ぶだけで
+    タイムラインの最新イベントを取得できます。定期的にポーリングすることで Bot の購読にも使えます。
+  </p>
+  <pre><code>curl "https://fodpr.yoinekodo.jp/api/events?limit=50"</code></pre>
+  <table>
+    <tr><th>クエリパラメータ</th><th>説明</th></tr>
+    <tr><td><code>limit</code></td><td>取得件数(既定 100, 最大 1000)</td></tr>
+    <tr><td><code>since</code></td><td>Unix 秒。これより後に投稿されたイベントのみ</td></tr>
+    <tr><td><code>after</code></td><td>前回取得したイベントの <code>dedupeKey</code>。これより新しいイベントのみ(次のページ用)</td></tr>
+    <tr><td><code>transType</code></td><td>フィルタ: 0=全, 1=JSON(プロフィール), 2=テキスト, 3=メディア</td></tr>
+    <tr><td><code>tagKey</code> / <code>tagVal</code></td><td>タグの絞り込み。例 <code>mediatype</code> / <code>image</code></td></tr>
+  </table>
+  <p>レスポンス例:</p>
+  <pre><code>{
+  "ok": true,
+  "events": [
+    {
+      "dedupeKey": "pubkey:2:1785981600:署名...",
+      "transType": 2,
+      "createdAt": 1785981600,
+      "pubkey": "02...",
+      "tags": [],
+      "content": "こんにちは、Fodpr の世界!",
+      "signature": "..."
+    }
+  ],
+  "count": 1,
+  "relayConnected": true
+}</code></pre>
+
+  <h3>イベントのタイプ(transType)と表示</h3>
+  <table>
+    <tr><th>transType</th><th>意味</th><th>content</th><th>tags</th></tr>
+    <tr><td><code>1</code> (JSON)</td><td>プロフィール</td><td><code>{"mode":"profile","name":"...","about":"...","picture":"..."}</code></td><td>(なし)</td></tr>
+    <tr><td><code>2</code> (String)</td><td>テキスト投稿・リアクション・リポスト・引用・リプライ</td><td>本文(テキスト投稿・引用・リプライ) / 絵文字(リアクション) / 空(リポスト)</td><td><code>react:</code> <code>quote:</code> <code>repost:</code> <code>reply:</code></td></tr>
+    <tr><td><code>3</code> (Binary)</td><td>メディア投稿</td><td><code>mime:base64</code> 例 <code>image/png:iVBOR...</code></td><td><code>caption:</code> <code>filename:</code> <code>mediatype:</code></td></tr>
+  </table>
+
+  <h2>状態確認 <span class="method get">GET</span><code>/api/health</code></h2>
+  <p>サーバーとリレーの接続状態を確認します。</p>
+  <pre><code>curl https://fodpr.yoinekodo.jp/api/health</code></pre>
+  <pre><code>{
+  "ok": true,
+  "relayConnected": true,
+  "relay": "ws://localhost:8000/",
+  "buffered": 1284,
+  "totalEvents": 1284
+}</code></pre>
+
+  <h2>Bot の作り方(例)</h2>
+  <p>Python でのテキスト投稿の例:</p>
+  <pre><code>import json, urllib.request
+
+KEY = "64桁のHEX秘密鍵"  # 事前に /api/keygen で作成
+
+req = urllib.request.Request(
+    "https://fodpr.yoinekodo.jp/api/note",
+    data=json.dumps({"privKey": KEY, "content": "にゃーん"}).encode(),
+    headers={"Content-Type": "application/json"},
+)
+print(json.load(urllib.request.urlopen(req)))
+</code></pre>
+  <p>JavaScript(Node.js)での投稿と取得の例:</p>
+  <pre><code>const base = "https://fodpr.yoinekodo.jp/api";
+
+// 投稿
+const res = await fetch(base + "/note", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ privKey: KEY, content: "にゃーん" }),
+});
+const posted = await res.json();
+
+// 取得(投稿直後から 10 件)
+const feed = await fetch(base + "/events?since=" + Math.floor(Date.now()/1000) + "&limit=10").then(r => r.json());
+</code></pre>
+
+  <h2>詳細なワイヤプロトコル(上級者向け)</h2>
+  <p>
+    この API はリレーとの通信をすべて内部で行いますが、独自クライアントを実装する場合は
+    <a href="https://fodpr.yoinekodo.jp/api/docs">この API</a> を使わずに WebSocket(バイナリフレーム)で直接リレーに接続することもできます。
+    イベントのバイナリ構造・タグ仕様・dedupeKey の詳細は Web クライアントの設定から「クライアント実装ガイド」をご覧ください。
+  </p>
+</div>
+</body>
+</html>

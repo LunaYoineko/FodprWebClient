@@ -22,7 +22,8 @@ import { useRelay, type RelayStatus } from './hooks/useRelay';
 
 // 既定の接続先リレー(設定画面から追加・削除可能)
 const DEFAULT_RELAYS = [
-  'wss://fodpr-relay.yoinekodo.jp/'
+  'wss://fodpr-relay.yoinekodo.jp/',
+  'wss://fodpr-subrelay.yoinekodo.jp/'
 ];
 const RELAYS_STORAGE_KEY = 'fodpr_relays';
 
@@ -71,6 +72,7 @@ function splitEvents(events: FodprEvent[]) {
     notes: [] as FodprEvent[],
     binaries: [] as FodprEvent[],
     reactions: [] as FodprEvent[],
+    replies: [] as FodprEvent[],
     links: [] as FodprEvent[],
     others: [] as FodprEvent[],
   };
@@ -90,6 +92,9 @@ function splitEvents(events: FodprEvent[]) {
       // リアクション: content=絵文字、tags に react:<対象イベントの dedupeKey>
       if (e.tags.some((t) => t.startsWith('react:'))) {
         out.reactions.push(e);
+      } else if (e.tags.some((t) => t.startsWith('reply:'))) {
+        // リプライ: content=返信本文、tags に reply:<対象イベントの dedupeKey>
+        out.replies.push(e);
       } else if (e.tags.some((t) => t.startsWith('repost:')) || e.tags.some((t) => t.startsWith('quote:'))) {
         // リポスト/引用リポスト: tags に repost:<key> / quote:<key>
         out.links.push(e);
@@ -195,6 +200,27 @@ function quoteTarget(e: FodprEvent): string | null {
   return null;
 }
 
+// リプライイベントのタグ(reply:<対象の dedupeKey>)から対象イベントのキーを取り出す
+function replyTag(e: FodprEvent): string | null {
+  for (const t of e.tags) {
+    if (t.startsWith('reply:')) return t.slice('reply:'.length);
+  }
+  return null;
+}
+
+// リプライの対象投稿者名(表示用)。対象イベントが見つからない場合は null
+function replyParentName(
+  e: FodprEvent,
+  eventByKey: Map<string, FodprEvent>,
+  profileMap: Record<string, FodprEvent>,
+): string | null {
+  const key = replyTag(e);
+  if (!key) return null;
+  const target = eventByKey.get(key);
+  if (!target) return null;
+  return resolveDisplayName(CryptoUtils.bytesToHex(target.pubkey), profileMap);
+}
+
 // イベント本文の短い抜粋(引用プレビュー用)
 function eventSnippet(e: FodprEvent | undefined): string {
   if (!e) return '';
@@ -221,6 +247,9 @@ function aggregateReactions(list: ReactionItem[] | undefined, selfPubkeyHex: str
 
 type ReactionItem = { emoji: string; pubkey: string };
 type ReactionMap = Map<string, ReactionItem[]>;
+
+// 対象イベントの dedupeKey をキーに、そのイベントへのリプライを束ねる
+type ReplyMap = Map<string, FodprEvent[]>;
 
 // 投稿(テキスト/画像)を最新順(createdAt 降順)に並べる。同時刻は署名で安定ソート。
 function sortPostsDesc(posts: FodprEvent[]): FodprEvent[] {
@@ -423,8 +452,11 @@ function App() {
   const [mobileComposerOpen, setMobileComposerOpen] = useState(false);
   const isSm = useIsSm();
 
-  // クライアント実装ドキュメントページの表示/非表示(設定 -> 開く)
-  const [showDocs, setShowDocs] = useState(false);
+  // クライアント実装ドキュメントページを新しいタブで開く
+  function openDocs() {
+    const url = new URL('docs.html', window.location.href);
+    window.open(url.href, '_blank', 'noopener');
+  }
 
   function toggleComposer() {
     if (isSm) {
@@ -452,6 +484,9 @@ function App() {
   // 引用リポスト中の対象イベントの dedupeKey(非 null ならコンポーザが引用モード)
   const [quoteTarget, setQuoteTarget] = useState<string | null>(null);
 
+  // リプライ中の対象イベントの dedupeKey(非 null ならコンポーザが返信モード)
+  const [replyTarget, setReplyTarget] = useState<string | null>(null);
+
   // 画像/動画/ファイル投稿(Binary)用の添付状態
   const [mediaDataUrl, setMediaDataUrl] = useState<string | null>(null);
   const [mediaName, setMediaName] = useState<string | null>(null);
@@ -462,6 +497,10 @@ function App() {
 
   // 自クライアントの投稿を即座にフィードに反映するためのローカル蓄積(Optimistic)
   const [localEvents, setLocalEvents] = useState<FodprEvent[]>([]);
+
+  // 削除済みイベントの dedupeKey 集合。削除後もリレーが過去の PUSH を保持するため、
+  // 受信済みイベントもここで非表示にする(Optimistic 削除を永続化する)。
+  const [deletedKeys, setDeletedKeys] = useState<Set<string>>(new Set());
 
   // 起動時: 暗号化された秘密鍵を復号して自動ログインする(旧平文保存からの移行も行う)
   useEffect(() => {
@@ -499,7 +538,8 @@ function App() {
     [relay.messages],
   );
 
-  // サーバー受信 + 自投稿をマージ(重複排除)してフィードのソースにする
+  // サーバー受信 + 自投稿をマージ(重複排除)してフィードのソースにする。
+  // 削除済みのイベントはここで除外する。
   const allEvents = useMemo(() => {
     const seen = new Set<string>();
     const merged: FodprEvent[] = [];
@@ -517,10 +557,13 @@ function App() {
         merged.push(e);
       }
     }
-    return merged;
-  }, [receivedEvents, localEvents]);
+    return merged.filter((e) => !deletedKeys.has(dedupeKey(e)));
+  }, [receivedEvents, localEvents, deletedKeys]);
 
-  const { profiles, notes, binaries, reactions, links, others } = useMemo(() => splitEvents(allEvents), [allEvents]);
+  const { profiles, notes, binaries, reactions, replies, links, others } = useMemo(
+    () => splitEvents(allEvents),
+    [allEvents],
+  );
   const profileMap = useMemo(() => latestProfilePerPubkey(profiles), [profiles]);
 
   // dedupeKey -> イベント の解決マップ(リポスト/引用の対象を引くために使う)
@@ -542,6 +585,19 @@ function App() {
     }
     return m;
   }, [reactions]);
+
+  // リプライを対象イベントの dedupeKey ごとにまとめる
+  const replyMap: ReplyMap = useMemo(() => {
+    const m: ReplyMap = new Map();
+    for (const e of replies) {
+      const key = replyTag(e);
+      if (!key) continue;
+      const list = m.get(key) ?? [];
+      list.push(e);
+      m.set(key, list);
+    }
+    return m;
+  }, [replies]);
 
   // 接続確立後に一度 REQ(All) して保存済みイベントを取得する(再接続・リレー変更時にも再送)
   useEffect(() => {
@@ -605,8 +661,10 @@ function App() {
     // 送信 (relay.sendDel が MsgTypeDel(0x03) 付きパケットを送信する)
     try {
       relay.sendDel(delReq);
-      // Optimistic: ローカルから削除
-      setLocalEvents((prev) => prev.filter((e) => dedupeKey(e) !== dedupeKey(targetEvent)));
+      // Optimistic: ローカル + 受信済みを問わずフィードから削除
+      const key = dedupeKey(targetEvent);
+      setDeletedKeys((prev) => new Set(prev).add(key));
+      setLocalEvents((prev) => prev.filter((e) => dedupeKey(e) !== key));
     } catch (e) {
       console.error('Delete failed:', e);
       alert('削除に失敗しました');
@@ -701,14 +759,22 @@ function App() {
       sendSignedEvent(TransTypeString, content, sig, [`quote:${quoteTarget}`]);
       setNoteText('');
       setQuoteTarget(null);
-      // 投稿後は入力欄を閉じる
+      // 投稿後は入力欄を閉じる(デスクトップは表示を維持、モバイルはモーダルを閉じる)
       setMobileComposerOpen(false);
-      if (isSm) {
-        setMobileComposerOpen(false);
-      } else {
-        setComposerHidden(true);
-        localStorage.setItem('fodpr_composer_hidden', '1');
-      }
+      if (!isSm) setComposerHidden(true);
+      return;
+    }
+
+    // リプライ: 本文 + reply:<対象> タグの TransTypeString(対象の投稿への返信)
+    if (replyTarget) {
+      if (!content) return;
+      const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(content));
+      sendSignedEvent(TransTypeString, content, sig, [`reply:${replyTarget}`]);
+      setNoteText('');
+      setReplyTarget(null);
+      // 投稿後は入力欄を閉じる(デスクトップは表示を維持、モバイルはモーダルを閉じる)
+      setMobileComposerOpen(false);
+      if (!isSm) setComposerHidden(true);
       return;
     }
 
@@ -734,10 +800,9 @@ function App() {
       setMediaSize(0);
       setMediaType(null);
       setMediaThumbnail(null);
-      // 投稿後は入力欄を閉じる
-      if (isSm) {
-        setMobileComposerOpen(false);
-      } else {
+      // 投稿後は入力欄を閉じる(デスクトップは表示を維持、モバイルはモーダルを閉じる)
+      setMobileComposerOpen(false);
+      if (!isSm) {
         setComposerHidden(true);
         localStorage.setItem('fodpr_composer_hidden', '1');
       }
@@ -748,13 +813,9 @@ function App() {
     const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(content));
     sendSignedEvent(TransTypeString, content, sig);
     setNoteText('');
-    // 投稿後は入力欄を閉じる
-    if (isSm) {
-      setMobileComposerOpen(false);
-    } else {
-      setComposerHidden(true);
-      localStorage.setItem('fodpr_composer_hidden', '1');
-    }
+    // 投稿後は入力欄を閉じる(デスクトップは表示を維持、モバイルはモーダルを閉じる)
+    setMobileComposerOpen(false);
+    if (!isSm) setComposerHidden(true);
   };
 
   // 対象イベントへリアクション(絵文字)を投稿する。
@@ -785,6 +846,21 @@ function App() {
       setMobileComposerOpen(true);
     }
     setQuoteTarget(targetKey);
+  }
+
+  // リプライ開始: タイムラインへ戻ってコンポーザを返信モードにする
+  function startReply(targetKey: string) {
+    setView('timeline');
+    setOpenPubkey(null);
+    if (isSm) {
+      if (composerHidden) {
+        setComposerHidden(false);
+        localStorage.setItem('fodpr_composer_hidden', '0');
+      }
+    } else {
+      setMobileComposerOpen(true);
+    }
+    setReplyTarget(targetKey);
   }
 
   // プロフィール(JSON mode: profile)を投稿するハンドラ
@@ -820,6 +896,8 @@ function App() {
     setView('timeline');
     setOpenPubkey(null);
     setQuoteTarget(null);
+    setReplyTarget(null);
+    setDeletedKeys(new Set());
     setLocalEvents([]);
   }
 
@@ -851,6 +929,11 @@ function App() {
   const quoteName = quoteEvent
     ? resolveDisplayName(CryptoUtils.bytesToHex(quoteEvent.pubkey), profileMap)
     : undefined;
+  // 返信モード中は返信対象イベントとその投稿者名を解決してプレビューに使う
+  const replyEvent = replyTarget ? eventByKey.get(replyTarget) : undefined;
+  const replyName = replyEvent
+    ? resolveDisplayName(CryptoUtils.bytesToHex(replyEvent.pubkey), profileMap)
+    : undefined;
   // 投稿欄の表示状態(デスクトップ=下部固定、モバイル=中央モーダル)
   const composerVisible = isSm ? !composerHidden : mobileComposerOpen;
 
@@ -873,6 +956,7 @@ function App() {
                     setView(item.id);
                     setOpenPubkey(null);
                     setQuoteTarget(null);
+                    setReplyTarget(null);
                   }}
                   className={
                     'rounded-full px-3.5 py-1.5 text-sm transition-colors ' +
@@ -937,6 +1021,7 @@ function App() {
               profileMap={profileMap}
               notes={notes}
               binaries={binaries}
+              replies={replyMap}
               links={links}
               eventByKey={eventByKey}
               reactions={reactionMap}
@@ -946,6 +1031,7 @@ function App() {
               onReact={handleReact}
               onRepost={handleRepost}
               onQuote={startQuote}
+              onReply={startReply}
               onDelete={deleteEvent}
             />
           )}
@@ -953,6 +1039,7 @@ function App() {
             <Timeline
               notes={notes}
               binaries={binaries}
+              replies={replyMap}
               links={links}
               others={others}
               eventByKey={eventByKey}
@@ -963,6 +1050,7 @@ function App() {
               onReact={handleReact}
               onRepost={handleRepost}
               onQuote={startQuote}
+              onReply={startReply}
               onDelete={deleteEvent}
             />
           )}
@@ -987,7 +1075,7 @@ function App() {
               relayStatus={relay.relayStatus}
               relayConnected={relay.connected}
               onLogout={handleLogout}
-              onShowDocs={() => setShowDocs(true)}
+              onShowDocs={openDocs}
               secretHex={privKey}
             />
           )}
@@ -1009,6 +1097,10 @@ function App() {
                 quoteEvent={quoteEvent}
                 quoteName={quoteName}
                 onCancelQuote={() => setQuoteTarget(null)}
+                replyTarget={replyTarget}
+                replyEvent={replyEvent}
+                replyName={replyName}
+                onCancelReply={() => setReplyTarget(null)}
                 onPickFile={onPickFile}
                 onSubmit={postNote}
                 relayConnected={relay.connected}
@@ -1062,6 +1154,10 @@ function App() {
                       quoteEvent={quoteEvent}
                       quoteName={quoteName}
                       onCancelQuote={() => setQuoteTarget(null)}
+                      replyTarget={replyTarget}
+                      replyEvent={replyEvent}
+                      replyName={replyName}
+                      onCancelReply={() => setReplyTarget(null)}
                       onPickFile={onPickFile}
                       onSubmit={postNote}
                       relayConnected={relay.connected}
@@ -1075,9 +1171,6 @@ function App() {
           </>
         )}
       </div>
-
-      {/* クライアント実装ドキュメントページ(最上層オーバーレイ) */}
-      {showDocs && <DocsPage onClose={() => setShowDocs(false)} />}
     </div>
   );
 }
@@ -1088,23 +1181,27 @@ function App() {
 function PostCard({
   e,
   profileMap,
+  eventByKey,
   reactions,
   selfPubkeyHex,
   onOpenUser,
   onReact,
   onRepost,
   onQuote,
+  onReply,
   onDelete,
   embedded = false,
 }: {
   e: FodprEvent;
   profileMap: Record<string, FodprEvent>;
+  eventByKey: Map<string, FodprEvent>;
   reactions: ReactionItem[] | undefined;
   selfPubkeyHex: string;
   onOpenUser: (pubkeyHex: string) => void;
   onReact: (targetKey: string, emoji: string) => void;
   onRepost: (targetKey: string) => void;
   onQuote: (targetKey: string) => void;
+  onReply: (targetKey: string) => void;
   onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
   embedded?: boolean;
 }) {
@@ -1112,6 +1209,7 @@ function PostCard({
   const name = resolveDisplayName(pkHex, profileMap);
   const pic = profilePicture(profileMap[pkHex]);
   const key = dedupeKey(e);
+  const replyParent = replyParentName(e, eventByKey, profileMap);
 
   // Binary だがメディアとしてパースできないイベントは簡易表示する
   if (e.transType === TransTypeBinary) {
@@ -1148,7 +1246,24 @@ function PostCard({
                 {name}
               </button>
               <span className="text-xs text-gray-400">{new Date(e.createdAt * 1000).toLocaleString()}</span>
+              <OwnPostDeleteButton
+                targetKey={key}
+                targetEvent={e}
+                selfPubkeyHex={selfPubkeyHex}
+                onDelete={onDelete}
+              />
             </div>
+            {replyParent && (
+              <div className="mt-1 text-xs text-gray-500">
+                <ReplyIcon className="mr-1 inline h-3.5 w-3.5" />
+                <button
+                  onClick={() => onOpenUser(CryptoUtils.bytesToHex(eventByKey.get(replyTag(e) as string)!.pubkey))}
+                  className="transition-colors hover:text-gray-300 hover:underline"
+                >
+                  {replyParent} への返信
+                </button>
+              </div>
+            )}
             {caption && <p className="mt-2 text-lg leading-relaxed whitespace-pre-wrap break-words sm:text-xl">{caption}</p>}
             {isVideo ? (
               <video
@@ -1184,6 +1299,7 @@ function PostCard({
               onReact={onReact}
               onRepost={onRepost}
               onQuote={onQuote}
+              onReply={onReply}
               onDelete={onDelete}
             />
           </div>
@@ -1211,7 +1327,24 @@ function PostCard({
               {name}
             </button>
             <span className="text-xs text-gray-400">{new Date(e.createdAt * 1000).toLocaleString()}</span>
+            <OwnPostDeleteButton
+              targetKey={key}
+              targetEvent={e}
+              selfPubkeyHex={selfPubkeyHex}
+              onDelete={onDelete}
+            />
           </div>
+          {replyParent && (
+            <div className="mt-1 text-xs text-gray-500">
+              <ReplyIcon className="mr-1 inline h-3 w-3" />
+              <button
+                onClick={() => onOpenUser(CryptoUtils.bytesToHex(eventByKey.get(replyTag(e) as string)!.pubkey))}
+                className="transition-colors hover:text-gray-300 hover:underline"
+              >
+                {replyParent} への返信
+              </button>
+            </div>
+          )}
           <p className="mt-2 text-lg leading-relaxed whitespace-pre-wrap break-words sm:text-xl">{e.content}</p>
           <PostActions
             targetKey={key}
@@ -1222,6 +1355,7 @@ function PostCard({
             onReact={onReact}
             onRepost={onRepost}
             onQuote={onQuote}
+            onReply={onReply}
             onDelete={onDelete}
           />
         </div>
@@ -1246,6 +1380,10 @@ function Composer({
   quoteEvent,
   quoteName,
   onCancelQuote,
+  replyTarget,
+  replyEvent,
+  replyName,
+  onCancelReply,
   onPickFile,
   onSubmit,
   relayConnected,
@@ -1263,6 +1401,10 @@ function Composer({
   quoteEvent: FodprEvent | undefined;
   quoteName: string | undefined;
   onCancelQuote: () => void;
+  replyTarget: string | null;
+  replyEvent: FodprEvent | undefined;
+  replyName: string | undefined;
+  onCancelReply: () => void;
   onPickFile: (file: File | undefined) => void;
   onSubmit: () => void;
   relayConnected: boolean;
@@ -1272,10 +1414,10 @@ function Composer({
   const fileRef = useRef<HTMLInputElement>(null);
   const noteRef = useRef<HTMLTextAreaElement>(null);
 
-  // 引用モードに入ったら入力欄へ自動でフォーカスする
+  // 引用/返信モードに入ったら入力欄へ自動でフォーカスする
   useEffect(() => {
-    if (quoteTarget) noteRef.current?.focus();
-  }, [quoteTarget]);
+    if (quoteTarget || replyTarget) noteRef.current?.focus();
+  }, [quoteTarget, replyTarget]);
 
   return (
     <div className="p-3">
@@ -1313,11 +1455,25 @@ function Composer({
           </button>
         </div>
       )}
+      {replyTarget && (
+        <div className="flex items-center gap-3 rounded-xl border border-white/10 bg-black/20 px-3 py-2">
+          <span className="shrink-0 text-xs text-gray-400">返信先:</span>
+          <span className="min-w-0 flex-1 truncate text-xs text-gray-300">
+            {replyName ? `${replyName}: ${eventSnippet(replyEvent)}` : '返信先の投稿が見つかりません'}
+          </span>
+          <button
+            onClick={onCancelReply}
+            className="shrink-0 rounded-lg border border-white/15 px-2.5 py-1 text-xs text-gray-400 transition-colors hover:bg-white/10"
+          >
+            解除
+          </button>
+        </div>
+      )}
       <div className="flex items-end gap-3">
         <textarea
           ref={noteRef}
           className="max-h-40 flex-1 resize-none rounded-xl bg-black/30 p-3 text-base text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-white/25"
-          placeholder={quoteTarget ? '引用して投稿する...' : '何か投稿する...'}
+          placeholder={replyTarget ? '返信を投稿する...' : quoteTarget ? '引用して投稿する...' : '何か投稿する...'}
           value={noteText}
           onChange={(e) => setNoteText(e.target.value)}
           onKeyDown={(e) => {
@@ -1331,14 +1487,17 @@ function Composer({
         <div className="flex shrink-0 gap-2">
           <button
             onClick={() => fileRef.current?.click()}
-            disabled={!relayConnected || !!quoteTarget}
+            disabled={!relayConnected || !!quoteTarget || !!replyTarget}
             className="rounded-xl border border-white/15 px-3 py-2.5 text-sm font-semibold text-gray-300 transition-colors hover:bg-white/10 disabled:opacity-40 sm:px-4 sm:py-3"
           >
             添付
           </button>
           <button
             onClick={() => void onSubmit()}
-            disabled={!relayConnected || (quoteTarget ? !noteText.trim() : !noteText.trim() && !mediaDataUrl)}
+            disabled={
+              !relayConnected ||
+              (quoteTarget || replyTarget ? !noteText.trim() : !noteText.trim() && !mediaDataUrl)
+            }
             className="rounded-xl bg-primary px-4 py-2.5 text-sm font-semibold text-bg transition-colors hover:bg-primary-hover disabled:opacity-40 sm:px-6 sm:py-3"
           >
             投稿
@@ -1380,6 +1539,106 @@ function RepostIcon({ className }: { className?: string }) {
   );
 }
 
+// リプライの吹き出しアイコン
+function ReplyIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+    </svg>
+  );
+}
+
+// 縦3点アイコン(メニューボタン)
+function KebabIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="5" r="1" />
+      <circle cx="19" cy="12" r="1" />
+      <circle cx="5" cy="12" r="1" />
+    </svg>
+  );
+}
+
+// 自分の投稿の右上に表示するメニューボタン。メニューから「削除」を選ぶと投稿が消える。
+// 自分の投稿でなければ何も表示しない。
+function OwnPostDeleteButton({
+  targetKey,
+  targetEvent,
+  selfPubkeyHex,
+  onDelete,
+}: {
+  targetKey: string;
+  targetEvent: FodprEvent | undefined;
+  selfPubkeyHex: string;
+  onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
+}) {
+  const isOwnPost = targetEvent && CryptoUtils.bytesToHex(targetEvent.pubkey) === selfPubkeyHex;
+  if (!isOwnPost || !targetEvent) return null;
+
+  const [open, setOpen] = useState(false);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const menuPos = useMemo(() => {
+    const el = btnRef.current;
+    if (!el) return { display: 'none' };
+    const r = el.getBoundingClientRect();
+    return { left: r.left, bottom: window.innerHeight - r.top + 6 };
+  }, [open]);
+
+  return (
+    <>
+      <button
+        ref={btnRef}
+        onClick={() => setOpen((o) => !o)}
+        title="メニュー(削除)"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className="ml-1 shrink-0 rounded-full border border-white/15 p-1 text-gray-400 opacity-60 transition-opacity hover:opacity-100 hover:bg-white/10"
+      >
+        <KebabIcon className="h-3.5 w-3.5" />
+      </button>
+      {open &&
+        createPortal(
+          <>
+            <button className="fixed inset-0 z-40 cursor-default" aria-hidden="true" onClick={() => setOpen(false)} />
+            <div
+              className="fixed z-50 min-w-28 overflow-hidden rounded-xl border border-white/15 bg-[#14161a] shadow-xl"
+              style={menuPos}
+            >
+              <button
+                onClick={() => {
+                  setOpen(false);
+                  if (confirm('この投稿を削除しますか？')) onDelete(targetKey, targetEvent);
+                }}
+                className="block w-full px-3.5 py-2 text-left text-sm text-red-400 transition-colors hover:bg-red-400/10"
+              >
+                削除
+              </button>
+            </div>
+          </>,
+          document.body,
+        )}
+    </>
+  );
+}
+
 // リアクションのハート。未反応ならアウトライン、反応済みなら塗りつぶし表示
 function HeartIcon({ filled, className }: { filled: boolean; className?: string }) {
   return (
@@ -1398,8 +1657,8 @@ function HeartIcon({ filled, className }: { filled: boolean; className?: string 
   );
 }
 
-// 投稿アクション行: ハート(未反応=アウトライン / 反応済み=塗り) + リポスト/引用/削除アイコン。
-// ハートとリポストアイコンは横並び。リポストアイコンを押すとメニューで「リポスト」「引用」「削除」を選べる。
+// 投稿アクション行: リプライ + ハート(未反応=アウトライン / 反応済み=塗り) + リポスト/引用/削除アイコン。
+// リポストアイコンを押すとメニューで「リポスト」「引用」「削除」を選べる。
 function PostActions({
   targetKey,
   reactions,
@@ -1409,6 +1668,7 @@ function PostActions({
   onReact,
   onRepost,
   onQuote,
+  onReply,
   onDelete,
 }: {
   targetKey: string;
@@ -1419,6 +1679,7 @@ function PostActions({
   onReact: (targetKey: string, emoji: string) => void;
   onRepost: (targetKey: string) => void;
   onQuote: (targetKey: string) => void;
+  onReply: (targetKey: string) => void;
   onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -1455,6 +1716,14 @@ function PostActions({
       >
         <HeartIcon filled={selfReacted} className="h-4 w-4" />
         {total > 0 && <span>{total}</span>}
+      </button>
+      <button
+        onClick={() => onReply(targetKey)}
+        title="返信"
+        aria-label="返信"
+        className="rounded-full border border-white/15 p-1.5 text-gray-300 transition-colors hover:bg-white/10"
+      >
+        <ReplyIcon className="h-4 w-4" />
       </button>
       {!embedded && (
         <div className="relative">
@@ -1522,29 +1791,34 @@ function SharedCard({
   e,
   profileMap,
   reactions,
+  replies,
   eventByKey,
   selfPubkeyHex,
   onOpenUser,
   onReact,
   onRepost,
   onQuote,
+  onReply,
   onDelete,
   depth,
 }: {
   e: FodprEvent;
   profileMap: Record<string, FodprEvent>;
   reactions: ReactionMap;
+  replies: ReplyMap;
   eventByKey: Map<string, FodprEvent>;
   selfPubkeyHex: string;
   onOpenUser: (pubkeyHex: string) => void;
   onReact: (targetKey: string, emoji: string) => void;
   onRepost: (targetKey: string) => void;
   onQuote: (targetKey: string) => void;
+  onReply: (targetKey: string) => void;
   onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
   depth: number;
 }) {
   const pkHex = CryptoUtils.bytesToHex(e.pubkey);
   const name = resolveDisplayName(pkHex, profileMap);
+  const key = dedupeKey(e);
   const isQuote = quoteTarget(e) !== null;
   const targetKey = (isQuote ? quoteTarget(e) : repostTarget(e)) as string;
   const target = eventByKey.get(targetKey);
@@ -1556,6 +1830,12 @@ function SharedCard({
           <span className="font-semibold">{isQuote ? '引用' : 'リポスト'}</span>
           <span>・ {name}</span>
           <span className="text-gray-500">{new Date(e.createdAt * 1000).toLocaleString()}</span>
+          <OwnPostDeleteButton
+            targetKey={key}
+            targetEvent={e}
+            selfPubkeyHex={selfPubkeyHex}
+            onDelete={onDelete}
+          />
         </div>
         {isQuote && e.content.trim() && (
           <p className="mb-2 whitespace-pre-wrap break-words px-1 text-lg leading-relaxed text-gray-100 sm:text-xl">
@@ -1568,12 +1848,14 @@ function SharedCard({
               e={target}
               profileMap={profileMap}
               reactions={reactions}
+              replies={replies}
               eventByKey={eventByKey}
               selfPubkeyHex={selfPubkeyHex}
               onOpenUser={onOpenUser}
               onReact={onReact}
               onRepost={onRepost}
               onQuote={onQuote}
+              onReply={onReply}
               onDelete={onDelete}
               depth={depth + 1}
             />
@@ -1589,68 +1871,195 @@ function SharedCard({
 }
 
 // 通常投稿 / リポスト・引用を自動で振り分けるカードディスパッチャー
+// トップレベル(depth=0)の場合は直下のリプライスレッドも表示する
 function TimelineCard({
   e,
   profileMap,
   reactions,
+  replies,
   eventByKey,
   selfPubkeyHex,
   onOpenUser,
   onReact,
   onRepost,
   onQuote,
+  onReply,
   onDelete,
   depth = 0,
 }: {
   e: FodprEvent;
   profileMap: Record<string, FodprEvent>;
   reactions: ReactionMap;
+  replies: ReplyMap;
   eventByKey: Map<string, FodprEvent>;
   selfPubkeyHex: string;
   onOpenUser: (pubkeyHex: string) => void;
   onReact: (targetKey: string, emoji: string) => void;
   onRepost: (targetKey: string) => void;
   onQuote: (targetKey: string) => void;
+  onReply: (targetKey: string) => void;
   onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
   depth?: number;
 }) {
-  if (repostTarget(e) || quoteTarget(e)) {
-    if (depth >= 3) {
-      return (
+  const card =
+    repostTarget(e) || quoteTarget(e) ? (
+      depth >= 3 ? (
         <div className="rounded-lg border border-white/10 bg-black/20 p-3 text-xs text-gray-500">
           共有チェーンの上限です
         </div>
-      );
-    }
-    return (
-      <SharedCard
+      ) : (
+        <SharedCard
+          e={e}
+          profileMap={profileMap}
+          reactions={reactions}
+          replies={replies}
+          eventByKey={eventByKey}
+          selfPubkeyHex={selfPubkeyHex}
+          onOpenUser={onOpenUser}
+          onReact={onReact}
+          onRepost={onRepost}
+          onQuote={onQuote}
+          onReply={onReply}
+          onDelete={onDelete}
+          depth={depth}
+        />
+      )
+    ) : (
+      <PostCard
         e={e}
         profileMap={profileMap}
-        reactions={reactions}
         eventByKey={eventByKey}
+        reactions={reactions.get(dedupeKey(e))}
         selfPubkeyHex={selfPubkeyHex}
         onOpenUser={onOpenUser}
         onReact={onReact}
         onRepost={onRepost}
         onQuote={onQuote}
+        onReply={onReply}
         onDelete={onDelete}
-        depth={depth}
+        embedded={depth > 0}
       />
     );
+
+  // トップレベル表示のときだけ直下のリプライスレッドを畳む
+  if (depth === 0) {
+    return (
+      <div className="space-y-2">
+        {card}
+        <ReplyThread
+          targetKey={dedupeKey(e)}
+          replies={replies}
+          profileMap={profileMap}
+          reactions={reactions}
+          eventByKey={eventByKey}
+          selfPubkeyHex={selfPubkeyHex}
+          onOpenUser={onOpenUser}
+          onReact={onReact}
+          onReply={onReply}
+          onDelete={onDelete}
+        />
+      </div>
+    );
   }
+  return card;
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   リプライスレッド。対象イベントの dedupeKey から直接の返信を探して
+   時系列順(古い順)に表示し、各返信の下にさらに返信があれば再帰で続ける。
+   ──────────────────────────────────────────────────────────────────── */
+function ReplyThread({
+  targetKey,
+  replies,
+  profileMap,
+  reactions,
+  eventByKey,
+  selfPubkeyHex,
+  onOpenUser,
+  onReact,
+  onReply,
+  onDelete,
+  depth = 0,
+}: {
+  targetKey: string;
+  replies: ReplyMap;
+  profileMap: Record<string, FodprEvent>;
+  reactions: ReactionMap;
+  eventByKey: Map<string, FodprEvent>;
+  selfPubkeyHex: string;
+  onOpenUser: (pubkeyHex: string) => void;
+  onReact: (targetKey: string, emoji: string) => void;
+  onReply: (targetKey: string) => void;
+  onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
+  depth?: number;
+}) {
+  if (depth > 4) return null;
+  const list = (replies.get(targetKey) ?? [])
+    .slice()
+    .sort((a, b) => a.createdAt - b.createdAt || dedupeKey(a).localeCompare(dedupeKey(b)));
+  if (list.length === 0) return null;
+
   return (
-    <PostCard
-      e={e}
-      profileMap={profileMap}
-      reactions={reactions.get(dedupeKey(e))}
-      selfPubkeyHex={selfPubkeyHex}
-      onOpenUser={onOpenUser}
-      onReact={onReact}
-      onRepost={onRepost}
-      onQuote={onQuote}
-      onDelete={onDelete}
-      embedded={depth > 0}
-    />
+    <div className="ml-2 space-y-2 border-l-2 border-white/10 pl-3 sm:ml-3">
+      <p className="pt-1 text-[11px] font-medium tracking-wide text-gray-500">返信 {list.length} 件</p>
+      {list.map((r) => {
+        const rkHex = CryptoUtils.bytesToHex(r.pubkey);
+        const rName = resolveDisplayName(rkHex, profileMap);
+        const rKey = dedupeKey(r);
+        const parentName = replyParentName(r, eventByKey, profileMap);
+        return (
+          <div key={rKey} className="rounded-xl border border-white/10 bg-black/20 p-3">
+          <div className="flex items-baseline gap-2">
+            <button
+              onClick={() => onOpenUser(rkHex)}
+              className="font-semibold text-primary transition-colors hover:text-primary-hover hover:underline"
+            >
+              {rName}
+            </button>
+            <span className="text-xs text-gray-500">{new Date(r.createdAt * 1000).toLocaleString()}</span>
+            <OwnPostDeleteButton
+              targetKey={rKey}
+              targetEvent={r}
+              selfPubkeyHex={selfPubkeyHex}
+              onDelete={onDelete}
+            />
+          </div>
+            <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-100">{r.content}</p>
+            {parentName && (
+              <p className="mt-1 text-xs text-gray-500">
+                <ReplyIcon className="mr-1 inline h-3 w-3" />
+                {parentName} への返信
+              </p>
+            )}
+            <PostActions
+              targetKey={rKey}
+              reactions={reactions.get(rKey)}
+              selfPubkeyHex={selfPubkeyHex}
+              embedded
+              targetEvent={r}
+              onReact={onReact}
+              onRepost={() => {}}
+              onQuote={() => {}}
+              onReply={onReply}
+              onDelete={onDelete}
+            />
+            <ReplyThread
+              targetKey={rKey}
+              replies={replies}
+              profileMap={profileMap}
+              reactions={reactions}
+              eventByKey={eventByKey}
+              selfPubkeyHex={selfPubkeyHex}
+              onOpenUser={onOpenUser}
+              onReact={onReact}
+              onReply={onReply}
+              onDelete={onDelete}
+              depth={depth + 1}
+            />
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -1660,6 +2069,7 @@ function TimelineCard({
 function Timeline({
   notes,
   binaries,
+  replies,
   links,
   others,
   profileMap,
@@ -1670,10 +2080,12 @@ function Timeline({
   onReact,
   onRepost,
   onQuote,
+  onReply,
   onDelete,
 }: {
   notes: FodprEvent[];
   binaries: FodprEvent[];
+  replies: ReplyMap;
   links: FodprEvent[];
   others: FodprEvent[];
   profileMap: Record<string, FodprEvent>;
@@ -1684,10 +2096,20 @@ function Timeline({
   onReact: (targetKey: string, emoji: string) => void;
   onRepost: (targetKey: string) => void;
   onQuote: (targetKey: string) => void;
+  onReply: (targetKey: string) => void;
   onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
 }) {
   // テキスト/画像/共有を統合して最新順(上=最新)に並べる
   const posts = sortPostsDesc([...notes, ...binaries, ...links]);
+
+  // リレーにまだ対象投稿が無いリプライ(親が未取得)は末尾にフォールバック表示する
+  const orphanReplies = [...replies.values()]
+    .flat()
+    .filter((r) => {
+      const k = replyTag(r);
+      return !k || !eventByKey.has(k);
+    })
+    .sort((a, b) => b.createdAt - a.createdAt);
 
   return (
     <div className="space-y-3">
@@ -1699,15 +2121,40 @@ function Timeline({
           e={e}
           profileMap={profileMap}
           reactions={reactions}
+          replies={replies}
           eventByKey={eventByKey}
           selfPubkeyHex={selfPubkeyHex}
           onOpenUser={onOpenUser}
           onReact={onReact}
           onRepost={onRepost}
           onQuote={onQuote}
+          onReply={onReply}
           onDelete={onDelete}
         />
       ))}
+
+      {orphanReplies.length > 0 && (
+        <div className="space-y-2 pt-2">
+          <p className="text-[11px] font-medium tracking-wide text-gray-500">返信先が見つからない投稿</p>
+          {orphanReplies.map((e) => (
+            <TimelineCard
+              key={dedupeKey(e)}
+              e={e}
+              profileMap={profileMap}
+              reactions={reactions}
+              replies={replies}
+              eventByKey={eventByKey}
+              selfPubkeyHex={selfPubkeyHex}
+              onOpenUser={onOpenUser}
+              onReact={onReact}
+              onRepost={onRepost}
+              onQuote={onQuote}
+              onReply={onReply}
+              onDelete={onDelete}
+            />
+          ))}
+        </div>
+      )}
 
       {others.length > 0 && (
         <div className="space-y-2 pt-2">
@@ -1731,6 +2178,7 @@ function UserProfileView({
   profileMap,
   notes,
   binaries,
+  replies,
   links,
   reactions,
   eventByKey,
@@ -1740,12 +2188,14 @@ function UserProfileView({
   onReact,
   onRepost,
   onQuote,
+  onReply,
   onDelete,
 }: {
   pubkeyHex: string;
   profileMap: Record<string, FodprEvent>;
   notes: FodprEvent[];
   binaries: FodprEvent[];
+  replies: ReplyMap;
   links: FodprEvent[];
   reactions: ReactionMap;
   eventByKey: Map<string, FodprEvent>;
@@ -1755,13 +2205,16 @@ function UserProfileView({
   onReact: (targetKey: string, emoji: string) => void;
   onRepost: (targetKey: string) => void;
   onQuote: (targetKey: string) => void;
+  onReply: (targetKey: string) => void;
   onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
 }) {
   const prof = profileMap[pubkeyHex];
   const p = prof ? parseProfile(prof.content) : {};
   const name = p.name ?? pubkeyHex.slice(0, 12);
+  const allReplyEvents: FodprEvent[] = [];
+  for (const list of replies.values()) allReplyEvents.push(...list);
   const posts = sortPostsDesc(
-    [...notes, ...binaries, ...links].filter((e) => CryptoUtils.bytesToHex(e.pubkey) === pubkeyHex),
+    [...notes, ...binaries, ...allReplyEvents, ...links].filter((e) => CryptoUtils.bytesToHex(e.pubkey) === pubkeyHex),
   );
 
   return (
@@ -1802,12 +2255,14 @@ function UserProfileView({
             e={e}
             profileMap={profileMap}
             reactions={reactions}
+            replies={replies}
             eventByKey={eventByKey}
             selfPubkeyHex={selfPubkeyHex}
             onOpenUser={onOpenUser}
             onReact={onReact}
             onRepost={onRepost}
             onQuote={onQuote}
+            onReply={onReply}
             onDelete={onDelete}
           />
         ))
@@ -2246,125 +2701,4 @@ function LoginScreen({
    クライアント実装ドキュメントページ
    Fodpr のイベントフォーマットやタグ仕様を読み取り可能なページ。
    ──────────────────────────────────────────────────────────────────── */
-function DocsPage({ onClose }: { onClose: () => void }) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-bg/90 p-4" onClick={onClose}>
-      <div
-        className="relative max-h-[90dvh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-white/10 bg-bg/70 p-6 text-sm text-gray-200"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <button
-          onClick={onClose}
-          aria-label="閉じる"
-          title="閉じる"
-          className="absolute top-3 right-3 rounded-full border border-white/15 px-2.5 py-1 text-xs text-gray-400 transition-colors hover:bg-white/10"
-        >
-          閉じる
-        </button>
-        <div className="space-y-3 pr-6">
-          {parseMdBlocks().map((b, k) => renderMdBlock(b, k))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-const DOC_HEAD = `
-## イベントの基本形
-| フィールド | 型 | 説明 |
-| pubkey | bytes | 投稿者の公開鍵(Ed25519) |
-| signature | bytes | content に対する署名 |
-| transType | string | フォーマット種別(string/binary/json) |
-| content | string | 本文 / ペイロード |
-| tags | string[] | 補足情報 |
-| createdAt | number | Unix 秒タイムスタンプ |
-署名検証: signature = sign(privkey, content)
-## 投稿フォーマット
-TransTypeString はテキスト投稿。transType = "string"; content = 本文; tags = []
-TransTypeBinary は画像投稿。transType = "binary"; content = "img:<MIME>;base64,<data>"; tags = ["caption:<キャプション>"]
-### リポスト
-transType = "string"; content = ""; tags = ["repost:<dedupeKey>"]
-### 引用
-transType = "string"; content = コメント; tags = ["quote:<dedupeKey>"]
-### リアクション(ハート)
-transType = "string"; content = "❤️"; tags = ["react:<dedupeKey>"]
-## dedupeKey
-base64(sha256(pubkey || createdAt || content || tags))
-## リレー一覧
-localStorage.fodpr_relays = JSON.stringify(["wss://example.com/", ...])  // 複数可
-`.trim();
-
-type MdBlock = { type: string; text?: string; code?: string; head?: string[]; rows?: string[][] };
-
-function parseMdBlocks(): MdBlock[] {
-  const out: MdBlock[] = [];
-  const lines = DOC_HEAD.split('\n');
-  let i = 0;
-  let para = '';
-  const flush = () => { if (para.trim()) out.push({ type: 'p', text: para.trim() }); para = ''; };
-  while (i < lines.length) {
-    const l = lines[i];
-    if (/^### /.test(l)) { flush(); out.push({ type: 'h3', text: l.slice(4) }); i++; continue; }
-    if (/^## /.test(l)) { flush(); out.push({ type: 'h2', text: l.slice(3) }); i++; continue; }
-    if (/^\|/.test(l)) {
-      flush();
-      const head = l.split('|').slice(1, -1).map((s) => s.trim());
-      const rows: string[][] = [];
-      i++;
-      while (i < lines.length && /^\|/.test(lines[i])) {
-        rows.push(lines[i].split('|').slice(1, -1).map((s) => s.trim()));
-        i++;
-      }
-      out.push({ type: 'table', head, rows });
-      continue;
-    }
-    if (/^```/.test(l)) {
-      flush();
-      const code: string[] = [];
-      i++;
-      while (i < lines.length && !/^```/.test(lines[i])) code.push(lines[i++]);
-      i++;
-      out.push({ type: 'code', code: code.join('\n') });
-      continue;
-    }
-    para += (para ? ' ' : '') + l;
-    i++;
-  }
-  flush();
-  return out;
-}
-
-function renderMdBlock(b: MdBlock, k: number) {
-  const key = `${k}-${b.type}`;
-  switch (b.type) {
-    case 'h2':
-      return <h3 key={key} className="mt-4 text-lg font-semibold text-primary">{b.text}</h3>;
-    case 'h3':
-      return <h4 key={key} className="mt-3 text-sm font-medium text-gray-300">{b.text}</h4>;
-    case 'p':
-      return <p key={key} className="leading-relaxed text-gray-300">{b.text}</p>;
-    case 'code':
-      return (
-        <pre key={key} className="my-2 overflow-x-auto rounded-lg bg-black/30 p-3 text-xs text-gray-300">
-          <code>{b.code}</code>
-        </pre>
-      );
-    case 'table':
-      return (
-        <table key={key} className="my-2 w-full border-collapse text-left text-xs">
-          <thead>
-            <tr>{b.head?.map((h) => <th key={h} className="border-b border-white/10 px-2 py-1 text-gray-400">{h}</th>)}</tr>
-          </thead>
-          <tbody>
-            {b.rows?.map((row, ri) => (
-              <tr key={ri}>{row.map((c, ci) => <td key={ci} className="border-b border-white/5 px-2 py-1">{c}</td>)}</tr>
-            ))}
-          </tbody>
-        </table>
-      );
-    default:
-      return null;
-  }
-}
-
 export default App;

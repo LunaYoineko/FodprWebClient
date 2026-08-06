@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "start:api": "node api/server.mjs",
+    "deploy": "pnpm build && cp -r dist/assets /var/www/fodpr/assets && cp dist/index.html /var/www/fodpr/index.html && cp public/docs.html /var/www/fodpr/docs.html && echo \"deployed to /var/www/fodpr\""
   },
   "devDependencies": {
     "@noble/hashes": "^2.2.0",

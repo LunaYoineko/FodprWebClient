@@ -1,6 +1,6 @@
 # Fodpr Web Client
 
-A browser-based client for [Fodpr](https://github.com/LunaYoineko/Fodpr) relay servers, styled like Nostter. It is built with TypeScript + React + Vite + Tailwind CSS and reuses the wire protocol (`Protocol`) and signing utilities (`CryptoUtils`) from the **[Fodpr TypeScript SDK](../FodprTSSDK)**.
+A browser-based client for [Fodpr](https://github.com/LunaYoineko/Fodpr) relay servers, Web Client. It is built with TypeScript + React + Vite + Tailwind CSS and reuses the wire protocol (`Protocol`) and signing utilities (`CryptoUtils`) from the **[Fodpr TypeScript SDK](../FodprTSSDK)**.
 
 > Japanese version: [README.md](README.md)
 

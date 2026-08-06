@@ -1,6 +1,6 @@
 # Fodpr Web Client
 
-[Fodpr](https://github.com/LunaYoineko/Fodpr) リレーサーバー向けの、Nostter のような UI を持つブラウザクライアント。
+[Fodpr](https://github.com/LunaYoineko/Fodpr) リレーサーバー向けのブラウザクライアント。
 TypeScript + React + Vite + Tailwind CSS でビルドし、**[Fodpr TypeScript SDK](../FodprTSSDK)** のワイヤプロトコル(`Protocol`)と署名ユーティリティ(`CryptoUtils`)をそのまま再利用している。
 
 > English version: [README.en.md](README.en.md)

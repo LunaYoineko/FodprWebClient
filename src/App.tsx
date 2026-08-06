@@ -1557,7 +1557,7 @@ function ReplyIcon({ className }: { className?: string }) {
   );
 }
 
-// 縦3点アイコン(メニューボタン)
+// メニューボタンの3点アイコン(縦並びの点)
 function KebabIcon({ className }: { className?: string }) {
   return (
     <svg
@@ -1571,8 +1571,8 @@ function KebabIcon({ className }: { className?: string }) {
       aria-hidden="true"
     >
       <circle cx="12" cy="5" r="1" />
-      <circle cx="19" cy="12" r="1" />
-      <circle cx="5" cy="12" r="1" />
+      <circle cx="12" cy="12" r="1" />
+      <circle cx="12" cy="19" r="1" />
     </svg>
   );
 }

@@ -17,6 +17,7 @@ import {
   MsgTypeEvent,
   type FodprEvent,
   type FodprReq,
+  type FodprDelReq,
 } from '@fodpr/protocol';
 
 // url を含まないメッセージ本文
@@ -138,6 +139,13 @@ export class RelayClient {
   sendReq(req: FodprReq) {
     this.ensureOpen();
     const payload = Protocol.encodeReq(req);
+    this.ws!.send(this.toArrayBuffer(payload));
+  }
+
+  // イベント削除要求(DEL)を送信。encodeDel は先頭に種別バイト(0x03)を含む。
+  sendDel(req: FodprDelReq) {
+    this.ensureOpen();
+    const payload = Protocol.encodeDel(req);
     this.ws!.send(this.toArrayBuffer(payload));
   }
 

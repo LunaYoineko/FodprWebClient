@@ -1,9 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
+  Protocol,
   TransTypeAll,
   TransTypeBinary,
   TransTypeJSON,
   TransTypeString,
+  DelTargetEvent,
+  type FodprDelReq,
   type FodprEvent,
   type FodprReq,
 } from '@fodpr/protocol';
@@ -11,6 +15,7 @@ import { CryptoUtils } from '@fodpr/crypto';
 import '@dpawlikowski/liquid-glass/css';
 import { LiquidGlass } from '@dpawlikowski/liquid-glass/react';
 import type { RelayMessage } from './lib/relay';
+import { sha256 } from '@noble/hashes/sha2.js';
 import { fsecToHex, hexToFsec } from './lib/bech32';
 import { clearSecret, loadSecret, migrateLegacySecret, saveSecret } from './lib/keystore';
 import { useRelay, type RelayStatus } from './hooks/useRelay';
@@ -28,6 +33,11 @@ function normalizeSecretKey(input: string): string {
   if (s.toLowerCase().startsWith('fsec')) return fsecToHex(s);
   if (!/^[0-9a-fA-F]{64}$/.test(s)) throw new Error('fsec 形式または 64桁の HEX で入力してください');
   return s.toLowerCase();
+}
+
+// 文字列の SHA-256 ハッシュ(32 バイト)を計算する
+function computeSHA256(data: string): Uint8Array {
+  return new Uint8Array(sha256(new TextEncoder().encode(data)));
 }
 
 // リレー一覧を localStorage から読み込む(不正な値は既定値へフォールバック)
@@ -137,12 +147,21 @@ function profilePicture(e: FodprEvent | undefined): string | null {
   return parseProfile(e.content).picture ?? null;
 }
 
-// 画像投稿(Binary)の content 形式: img:<mime>;base64,<data>
-const IMAGE_CONTENT_RE = /^img:([^;]+);base64,(.+)$/s;
+// メディア投稿(Binary)の content 形式: <mime>:<base64>
+// (旧形式の img:<mime>;base64,<data> にも互換対応する)
+const MEDIA_CONTENT_RE = /^(?:img:)?([^:;,]+)(?:;base64)?[,:](.+)$/s;
 
 function parseImageContent(content: string): { mime: string; base64: string } | null {
-  const m = IMAGE_CONTENT_RE.exec(content);
+  const m = MEDIA_CONTENT_RE.exec(content);
   return m ? { mime: m[1], base64: m[2] } : null;
+}
+
+// メディアイベントのタグ(filename:...)から元ファイル名を取り出す
+function filenameFromTags(tags: string[]): string | null {
+  for (const t of tags) {
+    if (t.startsWith('filename:')) return t.slice('filename:'.length);
+  }
+  return null;
 }
 
 // 画像イベントのタグ(caption:...)から説明文を取り出す
@@ -180,7 +199,9 @@ function quoteTarget(e: FodprEvent): string | null {
 function eventSnippet(e: FodprEvent | undefined): string {
   if (!e) return '';
   if (e.transType === TransTypeBinary) {
-    return parseImageContent(e.content) ? '画像' : '[バイナリ]';
+    const media = parseImageContent(e.content);
+    if (media) return media.mime.startsWith('video/') ? '動画' : '画像';
+    return '[バイナリ]';
   }
   const s = e.content.trim();
   return s.length > 80 ? s.slice(0, 80) + '…' : s;
@@ -556,6 +577,42 @@ function App() {
     relay.sendEvent(event);
   }
 
+  // イベントを削除する(DEL メッセージを送信)
+  async function deleteEvent(_targetKey: string, targetEvent: FodprEvent) {
+    if (!privKey || !relay.connected) return;
+
+    // 削除対象の公開鍵と自分の鍵が一致するか確認
+    const targetPubkeyHex = CryptoUtils.bytesToHex(targetEvent.pubkey);
+    const selfPubkeyHex = CryptoUtils.bytesToHex(pubkeyBytes);
+    if (targetPubkeyHex !== selfPubkeyHex) {
+      alert('自分の投稿しか削除できません');
+      return;
+    }
+
+    // DEL 要求を組み立てる(署名対象は Protocol.encodeDelSignedData が生成)
+    const delReq: FodprDelReq = {
+      transType: targetEvent.transType,
+      targetType: DelTargetEvent,
+      pubkey: targetEvent.pubkey,
+      createdAt: targetEvent.createdAt,
+      contentHash: computeSHA256(targetEvent.content),
+      signature: new Uint8Array(),
+    };
+    const signedData = Protocol.encodeDelSignedData(delReq);
+    const sigHex = await CryptoUtils.signMessage(privKey, signedData);
+    delReq.signature = CryptoUtils.hexToBytes(sigHex);
+
+    // 送信 (relay.sendDel が MsgTypeDel(0x03) 付きパケットを送信する)
+    try {
+      relay.sendDel(delReq);
+      // Optimistic: ローカルから削除
+      setLocalEvents((prev) => prev.filter((e) => dedupeKey(e) !== dedupeKey(targetEvent)));
+    } catch (e) {
+      console.error('Delete failed:', e);
+      alert('削除に失敗しました');
+    }
+  }
+
   // ファイル(画像/動画/ファイル)を選択して圧縮/処理し、data URL として保持する
   async function onPickFile(file: File | undefined) {
     setMediaError(null);
@@ -889,6 +946,7 @@ function App() {
               onReact={handleReact}
               onRepost={handleRepost}
               onQuote={startQuote}
+              onDelete={deleteEvent}
             />
           )}
           {!openPubkey && view === 'timeline' && (
@@ -905,6 +963,7 @@ function App() {
               onReact={handleReact}
               onRepost={handleRepost}
               onQuote={startQuote}
+              onDelete={deleteEvent}
             />
           )}
           {view === 'profile' && (
@@ -1022,7 +1081,6 @@ function App() {
     </div>
   );
 }
-
 /* ────────────────────────────────────────────────────────────────────
    投稿カード(テキスト/画像共通)。名前・アイコンクリックでそのユーザーの
    プロフィールを開き、リアクションの表示/投稿も行う。
@@ -1036,6 +1094,7 @@ function PostCard({
   onReact,
   onRepost,
   onQuote,
+  onDelete,
   embedded = false,
 }: {
   e: FodprEvent;
@@ -1046,6 +1105,7 @@ function PostCard({
   onReact: (targetKey: string, emoji: string) => void;
   onRepost: (targetKey: string) => void;
   onQuote: (targetKey: string) => void;
+  onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
   embedded?: boolean;
 }) {
   const pkHex = CryptoUtils.bytesToHex(e.pubkey);
@@ -1053,10 +1113,10 @@ function PostCard({
   const pic = profilePicture(profileMap[pkHex]);
   const key = dedupeKey(e);
 
-  // Binary だが画像としてパースできないイベントは簡易表示する
+  // Binary だがメディアとしてパースできないイベントは簡易表示する
   if (e.transType === TransTypeBinary) {
-    const img = parseImageContent(e.content);
-    if (!img) {
+    const media = parseImageContent(e.content);
+    if (!media) {
       return (
         <div className="rounded-lg border border-white/10 bg-black/30 p-3 text-sm text-gray-400">
           [Binary event · signature {e.signature.length} bytes]
@@ -1065,6 +1125,10 @@ function PostCard({
       );
     }
     const caption = captionFromTags(e.tags);
+    const filename = filenameFromTags(e.tags);
+    const mediaSrc = `data:${media.mime};base64,${media.base64}`;
+    const isVideo = media.mime.startsWith('video/');
+    const isImage = media.mime.startsWith('image/');
     return (
       <LiquidGlass intensity="subtle" refractive={false} className="liquid-glass--card w-full">
         <div className="flex gap-3 p-4">
@@ -1086,20 +1150,41 @@ function PostCard({
               <span className="text-xs text-gray-400">{new Date(e.createdAt * 1000).toLocaleString()}</span>
             </div>
             {caption && <p className="mt-2 text-lg leading-relaxed whitespace-pre-wrap break-words sm:text-xl">{caption}</p>}
-            <img
-              src={`data:${img.mime};base64,${img.base64}`}
-              alt={caption ?? '画像'}
-              loading="lazy"
-              className="mt-2 max-h-96 w-auto max-w-full rounded-xl"
-            />
+            {isVideo ? (
+              <video
+                controls
+                playsInline
+                preload="metadata"
+                src={mediaSrc}
+                className="mt-2 max-h-96 w-auto max-w-full rounded-xl"
+              />
+            ) : isImage ? (
+              <img
+                src={mediaSrc}
+                alt={caption ?? '画像'}
+                loading="lazy"
+                className="mt-2 max-h-96 w-auto max-w-full rounded-xl"
+              />
+            ) : (
+              <a
+                href={mediaSrc}
+                download={filename ?? 'file'}
+                className="mt-2 inline-flex items-center gap-2 rounded-xl border border-white/15 bg-black/20 px-3 py-2 text-sm text-gray-200 transition-colors hover:bg-white/10"
+              >
+                <span>ファイルをダウンロード</span>
+                {filename && <span className="break-all text-xs text-gray-400">{filename}</span>}
+              </a>
+            )}
             <PostActions
               targetKey={key}
               reactions={reactions}
               selfPubkeyHex={selfPubkeyHex}
               embedded={embedded}
+              targetEvent={e}
               onReact={onReact}
               onRepost={onRepost}
               onQuote={onQuote}
+              onDelete={onDelete}
             />
           </div>
         </div>
@@ -1133,9 +1218,11 @@ function PostCard({
             reactions={reactions}
             selfPubkeyHex={selfPubkeyHex}
             embedded={embedded}
+            targetEvent={e}
             onReact={onReact}
             onRepost={onRepost}
             onQuote={onQuote}
+            onDelete={onDelete}
           />
         </div>
       </div>
@@ -1311,29 +1398,46 @@ function HeartIcon({ filled, className }: { filled: boolean; className?: string 
   );
 }
 
-// 投稿アクション行: ハート(未反応=アウトライン / 反応済み=塗り) + リポスト/引用アイコン。
-// ハートとリポストアイコンは横並び。リポストアイコンを押すとメニューで「リポスト」「引用」を選べる。
+// 投稿アクション行: ハート(未反応=アウトライン / 反応済み=塗り) + リポスト/引用/削除アイコン。
+// ハートとリポストアイコンは横並び。リポストアイコンを押すとメニューで「リポスト」「引用」「削除」を選べる。
 function PostActions({
   targetKey,
   reactions,
   selfPubkeyHex,
   embedded,
+  targetEvent,
   onReact,
   onRepost,
   onQuote,
+  onDelete,
 }: {
   targetKey: string;
   reactions: ReactionItem[] | undefined;
   selfPubkeyHex: string;
   embedded: boolean;
+  targetEvent: FodprEvent | undefined;
   onReact: (targetKey: string, emoji: string) => void;
   onRepost: (targetKey: string) => void;
   onQuote: (targetKey: string) => void;
+  onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const btnRef = useRef<HTMLButtonElement>(null);
   const agg = aggregateReactions(reactions, selfPubkeyHex);
   const selfReacted = agg.some((r) => r.self);
   const total = agg.reduce((sum, r) => sum + r.count, 0);
+  
+  // 自分の投稿かどうか判定
+  const isOwnPost = targetEvent && CryptoUtils.bytesToHex(targetEvent.pubkey) === selfPubkeyHex;
+
+  // 開くたびにボタンの現在位置からメニューの表示位置を計算する
+  const menuPos = useMemo(() => {
+    const el = btnRef.current;
+    if (!el) return { display: 'none' };
+    const r = el.getBoundingClientRect();
+    return { left: r.left, bottom: window.innerHeight - r.top + 6 };
+  }, [open]);
+  
   return (
     <div className="mt-3 flex flex-wrap items-center gap-1.5">
       <button
@@ -1355,38 +1459,55 @@ function PostActions({
       {!embedded && (
         <div className="relative">
           <button
+            ref={btnRef}
             onClick={() => setOpen((o) => !o)}
-            title="共有(リポスト/引用)"
+            title="共有(リポスト/引用/削除)"
             aria-expanded={open}
             className="rounded-full border border-white/15 p-1.5 text-gray-300 transition-colors hover:bg-white/10"
           >
             <RepostIcon className="h-4 w-4" />
           </button>
-          {open && (
-            <>
-              <button className="fixed inset-0 z-10 cursor-default" aria-hidden="true" onClick={() => setOpen(false)} />
-              <div className="absolute bottom-full left-0 z-20 mb-1.5 min-w-36 overflow-hidden rounded-xl border border-white/15 bg-[#14161a] shadow-xl">
-                <button
-                  onClick={() => {
-                    setOpen(false);
-                    onRepost(targetKey);
-                  }}
-                  className="block w-full px-3.5 py-2 text-left text-sm text-gray-200 transition-colors hover:bg-white/10"
+          {open &&
+            createPortal(
+              <>
+                <button className="fixed inset-0 z-40 cursor-default" aria-hidden="true" onClick={() => setOpen(false)} />
+                <div
+                  className="fixed z-50 min-w-36 overflow-hidden rounded-xl border border-white/15 bg-[#14161a] shadow-xl"
+                  style={menuPos}
                 >
-                  リポスト
-                </button>
-                <button
-                  onClick={() => {
-                    setOpen(false);
-                    onQuote(targetKey);
-                  }}
-                  className="block w-full px-3.5 py-2 text-left text-sm text-gray-200 transition-colors hover:bg-white/10"
-                >
-                  引用
-                </button>
-              </div>
-            </>
-          )}
+                  <button
+                    onClick={() => {
+                      setOpen(false);
+                      onRepost(targetKey);
+                    }}
+                    className="block w-full px-3.5 py-2 text-left text-sm text-gray-200 transition-colors hover:bg-white/10"
+                  >
+                    リポスト
+                  </button>
+                  <button
+                    onClick={() => {
+                      setOpen(false);
+                      onQuote(targetKey);
+                    }}
+                    className="block w-full px-3.5 py-2 text-left text-sm text-gray-200 transition-colors hover:bg-white/10"
+                  >
+                    引用
+                  </button>
+                  {isOwnPost && (
+                    <button
+                      onClick={() => {
+                        setOpen(false);
+                        if (targetEvent) onDelete(targetKey, targetEvent);
+                      }}
+                      className="block w-full px-3.5 py-2 text-left text-sm text-red-400 transition-colors hover:bg-red-400/10"
+                    >
+                      削除
+                    </button>
+                  )}
+                </div>
+              </>,
+              document.body
+            )}
         </div>
       )}
     </div>
@@ -1407,6 +1528,7 @@ function SharedCard({
   onReact,
   onRepost,
   onQuote,
+  onDelete,
   depth,
 }: {
   e: FodprEvent;
@@ -1418,6 +1540,7 @@ function SharedCard({
   onReact: (targetKey: string, emoji: string) => void;
   onRepost: (targetKey: string) => void;
   onQuote: (targetKey: string) => void;
+  onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
   depth: number;
 }) {
   const pkHex = CryptoUtils.bytesToHex(e.pubkey);
@@ -1451,6 +1574,7 @@ function SharedCard({
               onReact={onReact}
               onRepost={onRepost}
               onQuote={onQuote}
+              onDelete={onDelete}
               depth={depth + 1}
             />
           </div>
@@ -1475,6 +1599,7 @@ function TimelineCard({
   onReact,
   onRepost,
   onQuote,
+  onDelete,
   depth = 0,
 }: {
   e: FodprEvent;
@@ -1486,6 +1611,7 @@ function TimelineCard({
   onReact: (targetKey: string, emoji: string) => void;
   onRepost: (targetKey: string) => void;
   onQuote: (targetKey: string) => void;
+  onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
   depth?: number;
 }) {
   if (repostTarget(e) || quoteTarget(e)) {
@@ -1507,6 +1633,7 @@ function TimelineCard({
         onReact={onReact}
         onRepost={onRepost}
         onQuote={onQuote}
+        onDelete={onDelete}
         depth={depth}
       />
     );
@@ -1521,6 +1648,7 @@ function TimelineCard({
       onReact={onReact}
       onRepost={onRepost}
       onQuote={onQuote}
+      onDelete={onDelete}
       embedded={depth > 0}
     />
   );
@@ -1542,6 +1670,7 @@ function Timeline({
   onReact,
   onRepost,
   onQuote,
+  onDelete,
 }: {
   notes: FodprEvent[];
   binaries: FodprEvent[];
@@ -1555,6 +1684,7 @@ function Timeline({
   onReact: (targetKey: string, emoji: string) => void;
   onRepost: (targetKey: string) => void;
   onQuote: (targetKey: string) => void;
+  onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
 }) {
   // テキスト/画像/共有を統合して最新順(上=最新)に並べる
   const posts = sortPostsDesc([...notes, ...binaries, ...links]);
@@ -1575,6 +1705,7 @@ function Timeline({
           onReact={onReact}
           onRepost={onRepost}
           onQuote={onQuote}
+          onDelete={onDelete}
         />
       ))}
 
@@ -1609,6 +1740,7 @@ function UserProfileView({
   onReact,
   onRepost,
   onQuote,
+  onDelete,
 }: {
   pubkeyHex: string;
   profileMap: Record<string, FodprEvent>;
@@ -1623,6 +1755,7 @@ function UserProfileView({
   onReact: (targetKey: string, emoji: string) => void;
   onRepost: (targetKey: string) => void;
   onQuote: (targetKey: string) => void;
+  onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
 }) {
   const prof = profileMap[pubkeyHex];
   const p = prof ? parseProfile(prof.content) : {};
@@ -1675,6 +1808,7 @@ function UserProfileView({
             onReact={onReact}
             onRepost={onRepost}
             onQuote={onQuote}
+            onDelete={onDelete}
           />
         ))
       )}

@@ -77,5 +77,15 @@ export function useRelay(urls: string[]) {
     }
   }, []);
 
-  return { connected, relayStatus, messages, sendEvent, sendReq };
+  const sendDel = useCallback((req: Parameters<RelayClient['sendDel']>[0]) => {
+    for (const client of clientsRef.current.values()) {
+      try {
+        client.sendDel(req);
+      } catch {
+        /* 未接続のリレーは無視 */
+      }
+    }
+  }, []);
+
+  return { connected, relayStatus, messages, sendEvent, sendReq, sendDel };
 }

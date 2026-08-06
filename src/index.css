@@ -1,0 +1,99 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ────────────────────────────────────────────────────────────────────
+   LiquidGlass ダークテーマ調整
+   ガラスの tint をページ背景色に合わせてダークにし、文字が読みやすい
+   濃さに調整する。
+   ──────────────────────────────────────────────────────────────────── */
+.liquid-glass {
+  --lg-tint: 22 26 33;
+  --lg-opacity: 0.78;
+  --lg-blur: 12px;
+  --lg-saturate: 150%;
+  --lg-border-opacity: 0.22;
+  --lg-radius: 20px;
+  --lg-shadow: 0 24px 70px rgb(0 0 0 / 0.45);
+  /* 波打ち(歪み)フィルターを無効化し、読みやすいすりガラス表示にする */
+  --lg-filter: none !important;
+  /* フォールバック用の背景(ライブbackdrop非対応ブラウザ向け) */
+  --lg-scene-background:
+    radial-gradient(60rem 60rem at 20% -10%, rgb(77 160 255 / 0.22), transparent 60%),
+    radial-gradient(50rem 50rem at 110% 20%, rgb(120 96 255 / 0.18), transparent 60%),
+    #0e1012;
+}
+
+.liquid-glass--nav {
+  --lg-radius: 999px;
+  --lg-blur: 22px;
+  --lg-opacity: 0.58;
+  --lg-border-opacity: 0.28;
+  --lg-shadow: 0 18px 60px rgb(0 0 0 / 0.4);
+}
+
+.liquid-glass--card {
+  --lg-opacity: 0.5;
+  --lg-blur: 14px;
+  --lg-radius: 18px;
+  --lg-shadow: 0 16px 50px rgb(0 0 0 / 0.35);
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   オーロラ風のページ背景(ガラスがぼかす下地)
+   ──────────────────────────────────────────────────────────────────── */
+.aurora {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  background-color: #0e1012;
+  background-image:
+    radial-gradient(60rem 60rem at 12% -10%, rgb(77 160 255 / 0.18), transparent 60%),
+    radial-gradient(50rem 50rem at 110% 15%, rgb(120 96 255 / 0.16), transparent 60%),
+    radial-gradient(70rem 70rem at 50% 120%, rgb(0 210 190 / 0.12), transparent 60%);
+}
+
+.aurora::before,
+.aurora::after {
+  content: "";
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(90px);
+  opacity: 0.35;
+  animation: aurora-drift 26s ease-in-out infinite alternate;
+}
+
+.aurora::before {
+  width: 46rem;
+  height: 46rem;
+  left: -12rem;
+  top: -8rem;
+  background: radial-gradient(circle, #3f7cff 0%, transparent 65%);
+}
+
+.aurora::after {
+  width: 40rem;
+  height: 40rem;
+  right: -10rem;
+  bottom: -6rem;
+  background: radial-gradient(circle, #38e0c8 0%, transparent 65%);
+  animation-duration: 34s;
+  animation-delay: -12s;
+}
+
+@keyframes aurora-drift {
+  from {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  to {
+    transform: translate3d(4rem, 3rem, 0) scale(1.15);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .aurora::before,
+  .aurora::after {
+    animation: none;
+  }
+}

@@ -1,0 +1,32 @@
+<!doctype html>
+<!--
+  index.html
+  ----------
+  Fodpr Web Client のエントリ HTML。
+  - `viewport-fit=cover` / `apple-mobile-web-app-capable=yes` により
+    iOS の PWA(ホーム画面アイコン起動)で安全領域(セイフエリア)や
+    ブラウザ下部ナビの被りを制御できる。
+  - `theme-color` はダークテーマ(#0e1012)のページ背景色。
+  - manifest / apple-touch-icon で PWA インストールを有効化。
+-->
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0e1012" />
+    <meta name="description" content="Fodpr - 分散型マイクロブログ" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Fodpr" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/icon-180.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <title>Fodpr</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -12,11 +12,14 @@
 //    (同一オリジンのスクリプトからは復号自体は可能だが、localStorage の
 //     平文露出や開発者ツールでの一覧表示による流出リスクを下げられる)
 
-const STORAGE_KEY = 'fodpr_vault';
+// Fodpr(fsec)用と Nostr(nsec)用で別々の保管場所を使う。
+const STORAGE_KEY = 'fodpr_vault'; // Fodpr fsec
 const LEGACY_STORAGE_KEY = 'fodpr_priv'; // 旧仕様: 平文で秘密鍵を保存していたキー
+const NOSTR_STORAGE_KEY = 'nostr_vault'; // Nostr nsec
 const DB_NAME = 'fodpr';
 const DB_STORE = 'keys';
-const DB_KEY = 'aes';
+const DB_KEY = 'aes'; // Fodpr の復号鍵
+const NOSTR_DB_KEY = 'aes_nostr'; // Nostr の復号鍵
 
 interface Vault {
   v: 2;
@@ -37,6 +40,8 @@ function fromBase64(b64: string): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 
+// IndexedDB のストアキーは DB_KEY / NOSTR_DB_KEY を別々に使い、
+// localStorage の保管場所も分離することで fsec と nsec を独立して扱う。
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, 1);
@@ -57,25 +62,25 @@ function dbRequest<T>(request: IDBRequest<T>): Promise<T> {
   });
 }
 
-async function getAesKey(db: IDBDatabase): Promise<CryptoKey | null> {
+async function getAesKey(db: IDBDatabase, key: string): Promise<CryptoKey | null> {
   const tx = db.transaction(DB_STORE, 'readonly');
-  const value = await dbRequest(tx.objectStore(DB_STORE).get(DB_KEY));
+  const value = await dbRequest(tx.objectStore(DB_STORE).get(key));
   return (value as CryptoKey | undefined) ?? null;
 }
 
-async function putAesKey(db: IDBDatabase, key: CryptoKey): Promise<void> {
+async function putAesKey(db: IDBDatabase, key: string, aes: CryptoKey): Promise<void> {
   const tx = db.transaction(DB_STORE, 'readwrite');
-  tx.objectStore(DB_STORE).put(key, DB_KEY);
-  await dbRequest(tx.objectStore(DB_STORE).get(DB_KEY)).catch(() => undefined);
+  tx.objectStore(DB_STORE).put(aes, key);
+  await dbRequest(tx.objectStore(DB_STORE).get(key)).catch(() => undefined);
   await new Promise<void>((resolve, reject) => {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error ?? new Error('IndexedDB write failed'));
   });
 }
 
-async function deleteAesKey(db: IDBDatabase): Promise<void> {
+async function deleteAesKey(db: IDBDatabase, key: string): Promise<void> {
   const tx = db.transaction(DB_STORE, 'readwrite');
-  tx.objectStore(DB_STORE).delete(DB_KEY);
+  tx.objectStore(DB_STORE).delete(key);
   await new Promise<void>((resolve) => {
     tx.oncomplete = () => resolve();
     tx.onerror = () => resolve(); // 削除失敗は無視
@@ -83,14 +88,18 @@ async function deleteAesKey(db: IDBDatabase): Promise<void> {
 }
 
 // 秘密鍵(HEX)を暗号化して保存する。呼び出し時点で IndexedDB / localStorage を初期化する
-export async function saveSecret(secretHex: string): Promise<void> {
+async function saveSecretFor(
+  storageKey: string,
+  dbKey: string,
+  secretHex: string,
+): Promise<void> {
   const aesKey = await crypto.subtle.generateKey(
     { name: 'AES-GCM', length: 256 },
     false, // extractable: false 非エクスポート可能
     ['encrypt', 'decrypt'],
   );
   const db = await openDb();
-  await putAesKey(db, aesKey);
+  await putAesKey(db, dbKey, aesKey);
   db.close();
 
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -104,26 +113,26 @@ export async function saveSecret(secretHex: string): Promise<void> {
     iv: toBase64(iv),
     data: toBase64(new Uint8Array(ciphertext)),
   };
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(vault));
+  localStorage.setItem(storageKey, JSON.stringify(vault));
 }
 
 // 保存された秘密鍵を復号して返す。失敗時や未保存時は null
-export async function loadSecret(): Promise<string | null> {
-  const raw = localStorage.getItem(STORAGE_KEY);
+async function loadSecretFor(storageKey: string, dbKey: string): Promise<string | null> {
+  const raw = localStorage.getItem(storageKey);
   if (!raw) return null;
   let vault: Vault;
   try {
     vault = JSON.parse(raw) as Vault;
   } catch {
-    await clearSecret();
+    localStorage.removeItem(storageKey);
     return null;
   }
   let db: IDBDatabase | null = null;
   try {
     db = await openDb();
-    const aesKey = await getAesKey(db);
+    const aesKey = await getAesKey(db, dbKey);
     if (!aesKey) {
-      await clearSecret();
+      localStorage.removeItem(storageKey);
       return null;
     }
     const plaintext = await crypto.subtle.decrypt(
@@ -133,7 +142,7 @@ export async function loadSecret(): Promise<string | null> {
     );
     return new TextDecoder().decode(plaintext);
   } catch {
-    await clearSecret();
+    localStorage.removeItem(storageKey);
     return null;
   } finally {
     db?.close();
@@ -141,15 +150,41 @@ export async function loadSecret(): Promise<string | null> {
 }
 
 // 保存済みの鍵を削除する(ログアウト)
-export async function clearSecret(): Promise<void> {
-  localStorage.removeItem(STORAGE_KEY);
+async function clearSecretFor(storageKey: string, dbKey: string): Promise<void> {
+  localStorage.removeItem(storageKey);
   try {
     const db = await openDb();
-    await deleteAesKey(db);
+    await deleteAesKey(db, dbKey);
     db.close();
   } catch {
     /* IndexedDB が使えない環境では localStorage の削除のみ行う */
   }
+}
+
+// ── Fodpr (fsec) ──
+export async function saveSecret(secretHex: string): Promise<void> {
+  await saveSecretFor(STORAGE_KEY, DB_KEY, secretHex);
+}
+
+export async function loadSecret(): Promise<string | null> {
+  return loadSecretFor(STORAGE_KEY, DB_KEY);
+}
+
+export async function clearSecret(): Promise<void> {
+  await clearSecretFor(STORAGE_KEY, DB_KEY);
+}
+
+// ── Nostr (nsec) ──
+export async function saveNostrSecret(secretHex: string): Promise<void> {
+  await saveSecretFor(NOSTR_STORAGE_KEY, NOSTR_DB_KEY, secretHex);
+}
+
+export async function loadNostrSecret(): Promise<string | null> {
+  return loadSecretFor(NOSTR_STORAGE_KEY, NOSTR_DB_KEY);
+}
+
+export async function clearNostrSecret(): Promise<void> {
+  await clearSecretFor(NOSTR_STORAGE_KEY, NOSTR_DB_KEY);
 }
 
 // 旧仕様(平文保存)のキーを掃除して暗号化保存へ移行する。

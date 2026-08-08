@@ -31,6 +31,16 @@ import {
   DelTargetEvent,
 } from 'fodpr-ts-sdk';
 
+// プロセス全体のエラーハンドラ
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
+// プロセス全体のエラーハンドラ
+
 // ────────────────────────────────────────────────────────────────────────────
 // 設定
 // ────────────────────────────────────────────────────────────────────────────
@@ -604,14 +614,44 @@ const server = http.createServer(async (req, res) => {
       res.end('Forbidden');
       return;
     }
-    const data = await fsp.readFile(filePath);
     const ext = path.extname(filePath).toLowerCase();
-    res.writeHead(200, {
-      'Content-Type': STATIC_TYPE[ext] || 'application/octet-stream',
-      'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=31536000',
-    });
-    res.end(data);
+    console.log(`[Static] Serving ${filePath} (ext=${ext})`);
+    try {
+      const data = await fsp.readFile(filePath);
+      console.log(`[Static] Read ${data.length} bytes from ${filePath}`);
+      res.writeHead(200, {
+        'Content-Type': STATIC_TYPE[ext] || 'application/octet-stream',
+        'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=31536000',
+      });
+      res.end(data);
+      console.log(`[Static] Sent ${data.length} bytes for ${filePath}`);
+    } catch (e) {
+      console.error(`[Static] Error reading ${filePath}:`, e);
+      if (e && e.code === 'ENOENT') {
+        // SPA フォールバック: HTML ファイルが見つからない場合は index.html を返す
+        if (ext === '.html' || pathname === '/') {
+          try {
+            const indexPath = path.resolve(STATIC_ROOT, 'index.html');
+            const data = await fsp.readFile(indexPath);
+            res.writeHead(200, {
+              'Content-Type': 'text/html; charset=utf-8',
+              'Cache-Control': 'no-cache',
+            });
+            res.end(data);
+            return;
+          } catch {}
+        }
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Not Found');
+      } else {
+        console.error('Static file error:', e);
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Internal Server Error');
+      }
+    }
+    console.log(`[Static] Request completed for ${filePath}`);
   } catch (e) {
+    console.error('[Server] Uncaught error in request handler:', e);
     if (e instanceof ApiError) {
       bad(res, e.status, e.message);
     } else if (e && e.code === 'ENOENT') {
@@ -629,9 +669,34 @@ const server = http.createServer(async (req, res) => {
 await fsp.mkdir(MEDIA_DIR, { recursive: true });
 connectSubscription();
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Fodpr REST API server listening on http://0.0.0.0:${PORT}`);
+server.listen({ port: PORT, host: '::', ipv6Only: false }, () => {
+  console.log(`Fodpr REST API server listening on http://[::]:${PORT} (dual-stack)`);
   console.log(`  static root: ${STATIC_ROOT}`);
   console.log(`  relay: ${RELAY_URL}`);
   console.log(`  media dir: ${MEDIA_DIR}`);
 });
+
+// プロセスが終了しないようキープアライブ
+setInterval(() => {}, 30000);
+
+process.on('exit', (code) => {
+  console.log(`[Process] Exiting with code ${code}`);
+});
+process.on('beforeExit', (code) => {
+  console.log(`[Process] Before exit with code ${code}`);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Process] Unhandled Rejection at:', promise, 'reason:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[Process] Uncaught Exception:', err);
+});
+process.on('SIGTERM', () => console.log('[Process] Received SIGTERM'));
+process.on('SIGINT', () => console.log('[Process] Received SIGINT'));
+
+// Keep the process alive explicitly
+process.stdin.resume();
+
+// Debug: log when process receives signals
+process.on('SIGTERM', () => console.log('[Process] Received SIGTERM'));
+process.on('SIGINT', () => console.log('[Process] Received SIGINT'));

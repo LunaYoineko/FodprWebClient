@@ -184,6 +184,162 @@ export function hexToNpub(pubkeyHex: string): string {
   return bech32Encode('npub', Uint8Array.from(bytes));
 }
 
+// --- NIP-19 (nevent / nprofile / naddr / note) ---
+
+// 任意の HRP を受け取る汎用 bech32 デコーダ(NIP-19 エンティティ用)
+export function bech32DecodeAny(bechStr: string): { hrp: string; data: Uint8Array } {
+  if (bechStr.length < 8) throw new Error('Bech32 string too short');
+
+  const pos = bechStr.lastIndexOf('1');
+  if (pos === -1 || pos < 1 || pos + 7 > bechStr.length) throw new Error('Invalid Bech32 format');
+
+  const hrp = bechStr.slice(0, pos).toLowerCase();
+
+  const data: number[] = [];
+  for (let i = pos + 1; i < bechStr.length; i++) {
+    const idx = CHARSET.indexOf(bechStr[i]);
+    if (idx === -1) throw new Error('Invalid character in Bech32 string');
+    data.push(idx);
+  }
+
+  const pm = polymod([...expandHrp(hrp), ...data]);
+  if (pm !== 1) throw new Error('Invalid checksum');
+
+  const decoded5bit = data.slice(0, data.length - 6);
+  return { hrp, data: Uint8Array.from(convertBits(decoded5bit, 5, 8, false)) };
+}
+
+// NIP-19 TLV を { type -> bytes[] } にパースする
+function parseTLV(data: Uint8Array): Map<number, Uint8Array[]> {
+  const out = new Map<number, Uint8Array[]>();
+  let i = 0;
+  while (i + 2 <= data.length) {
+    const t = data[i];
+    const len = data[i + 1];
+    if (i + 2 + len > data.length) break;
+    const value = data.slice(i + 2, i + 2 + len);
+    const arr = out.get(t) ?? [];
+    arr.push(value);
+    out.set(t, arr);
+    i += 2 + len;
+  }
+  return out;
+}
+
+function firstTLV(tlv: Map<number, Uint8Array[]>, t: number): Uint8Array | undefined {
+  return tlv.get(t)?.[0];
+}
+
+function tlvToHex(b: Uint8Array | undefined): string | undefined {
+  return b ? bytesToHex(b) : undefined;
+}
+
+function tlvToStr(b: Uint8Array | undefined): string | undefined {
+  return b ? new TextDecoder().decode(b) : undefined;
+}
+
+// NIP-19 TLV の kind (type 3) は varint エンコード
+function tlvToVarint(b: Uint8Array | undefined): number | undefined {
+  if (!b || b.length === 0) return undefined;
+  let n = 0;
+  for (let i = 0; i < b.length; i++) {
+    n = n * 128 + (b[i] & 0x7f);
+  }
+  return n;
+}
+
+export interface NostrEventPointer {
+  id: string;
+  relays?: string[];
+  author?: string;
+  kind?: number;
+}
+
+export interface NostrProfilePointer {
+  pubkey: string;
+  relays?: string[];
+}
+
+export interface NostrAddrPointer {
+  identifier: string;
+  pubkey: string;
+  kind: number;
+  relays?: string[];
+}
+
+// 単一エンティティのデコード結果(表示用リンク作成に使う)
+export type NostrInlineEntity =
+  | { type: 'npub'; value: string; relays?: string[] }
+  | { type: 'note'; value: string; relays?: string[] }
+  | { type: 'nevent'; value: NostrEventPointer; relays?: string[] }
+  | { type: 'nprofile'; value: NostrProfilePointer; relays?: string[] }
+  | { type: 'naddr'; value: NostrAddrPointer; relays?: string[] }
+  | { type: 'unknown'; value: string };
+
+// "nostr:nevent1..." / "nevent1..." 形式の NIP-19 URI をデコードする。
+// 失敗時は type:'unknown' を返す(表示はそのまま)。
+export function decodeNostrUri(uri: string): NostrInlineEntity {
+  const s = uri.trim();
+  const body = s.startsWith('nostr:') ? s.slice('nostr:'.length) : s;
+  try {
+    const { hrp, data } = bech32DecodeAny(body);
+    if (hrp === 'npub') {
+      if (data.length !== 32) return { type: 'unknown', value: s };
+      return { type: 'npub', value: bytesToHex(data) };
+    }
+    if (hrp === 'note') {
+      if (data.length !== 32) return { type: 'unknown', value: s };
+      return { type: 'note', value: bytesToHex(data) };
+    }
+    if (hrp === 'nevent') {
+      const tlv = parseTLV(data);
+      const id = tlvToHex(firstTLV(tlv, 0));
+      if (!id || id.length !== 64) return { type: 'unknown', value: s };
+      return {
+        type: 'nevent',
+        value: {
+          id,
+          relays: (tlv.get(1) ?? []).map((r) => new TextDecoder().decode(r)),
+          author: tlvToHex(firstTLV(tlv, 2)),
+          kind: tlvToVarint(firstTLV(tlv, 3)),
+        },
+      };
+    }
+    if (hrp === 'nprofile') {
+      const tlv = parseTLV(data);
+      const pubkey = tlvToHex(firstTLV(tlv, 0));
+      if (!pubkey || pubkey.length !== 64) return { type: 'unknown', value: s };
+      return {
+        type: 'nprofile',
+        value: {
+          pubkey,
+          relays: (tlv.get(1) ?? []).map((r) => new TextDecoder().decode(r)),
+        },
+      };
+    }
+    if (hrp === 'naddr') {
+      const tlv = parseTLV(data);
+      const identifier = tlvToStr(firstTLV(tlv, 0));
+      const pubkey = tlvToHex(firstTLV(tlv, 2));
+      const kind = tlvToVarint(firstTLV(tlv, 3));
+      if (!identifier || !pubkey || pubkey.length !== 64 || kind === undefined) {
+        return { type: 'unknown', value: s };
+      }
+      return {
+        type: 'naddr',
+        value: {
+          identifier,
+          pubkey,
+          kind,
+          relays: (tlv.get(1) ?? []).map((r) => new TextDecoder().decode(r)),
+        },
+      };
+    }
+    return { type: 'unknown', value: s };
+  } catch {
+    return { type: 'unknown', value: s };
+  }
+}
 // --- Event serialization (NIP-01) ---
 
 function serializeEvent(ev: UnsignedNostrEvent): Uint8Array {
@@ -366,7 +522,15 @@ export function findPTag(ev: NostrEvent): string | null {
 export function buildReplyTags(targetId: string, targetPubkey: string): NostrTags {
   return [
     ['e', targetId, '', 'reply'],
-    ['p', targetPubkey],
+    ...(targetPubkey ? [['p', targetPubkey]] : []),
+  ];
+}
+
+// Build quote tags (NIP-10 marker 'q')
+export function buildQuoteTags(targetId: string, targetPubkey: string): NostrTags {
+  return [
+    ['e', targetId, '', 'q'],
+    ...(targetPubkey ? [['p', targetPubkey]] : []),
   ];
 }
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Protocol,
@@ -38,11 +38,22 @@ import {
   signEventAsync,
   buildReactionTags,
   buildReplyTags,
+  buildQuoteTags,
   type NostrEvent,
   type NostrTags,
 } from './lib/nostrProtocol';
 import { fetchNostrKind0, fetchNostrRelayList, type RelayList } from './lib/nostrRelay';
 import { useNostrRelay, type NostrRelayStatus } from './hooks/useNostrRelay';
+import {
+  CUSTOM_EMOJI,
+  buildFodprEmojiTags,
+  buildNostrEmojiTags,
+  parseFodprEmojiTags,
+  parseNostrEmojiTags,
+  renderCustomEmojis,
+  renderNostrContent,
+  type CustomEmojiDef,
+} from './lib/customEmoji';
 
 // 既定の接続先リレー(設定画面から追加・削除可能)
 const DEFAULT_RELAYS = [
@@ -55,8 +66,42 @@ const RELAYS_STORAGE_KEY = 'fodpr_relays';
 const DEFAULT_NOSTR_RELAYS = ['wss://relay.yoinekodo.jp/'];
 const NOSTR_RELAYS_STORAGE_KEY = 'nostr_relays';
 
+// fsec 未ログイン時に nsec でゲストモードへ入ったことを記録するキー。
+// nsec は vault(localStorage + IndexedDB)へ永続化されるがゲストモード自体は
+// メモリ上のみなので、リロード後も nsec ログインを復元するために使う。
+const NOSTR_GUEST_STORAGE_KEY = 'fodpr_nostr_guest';
+
 // ネットワーク(Fodpr / Nostr)のタブ識別子
 type ProtocolTab = 'fodpr' | 'nostr';
+
+// 背景テーマ。localStorage に保存し、設定画面から変更できる
+type ThemeId = 'aurora' | 'modern';
+const THEME_STORAGE_KEY = 'fodpr_theme';
+
+// 背景テーマの選択肢(設定画面用)
+const THEME_OPTIONS: { id: ThemeId; label: string; desc: string }[] = [
+  { id: 'aurora', label: 'オーロラ', desc: '淡いグラデーションの動く背景' },
+  { id: 'modern', label: 'ダークグラデ', desc: 'IMG_2232.webp の配色をベースにした夕暮れ風のグラデーション(写真は敷かない)' },
+];
+
+// ブラウザ通知のオン/オフ(localStorage 保存)
+const BROWSER_NOTIF_STORAGE_KEY = 'fodpr_browser_notifications';
+// すでにブラウザ通知を飛ばした通知 id の集合(localStorage 保存・再通知防止)
+const NOTIF_NOTIFIED_STORAGE_KEY = 'fodpr_notified_notifs';
+
+// すでに通知した id 集合を localStorage から復元する
+function loadNotifiedIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem(NOTIF_NOTIFIED_STORAGE_KEY);
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) return new Set(arr.map((x) => String(x)));
+    }
+  } catch {
+    /* ignore */
+  }
+  return new Set<string>();
+}
 
 // 入力された秘密鍵文字列を HEX に正規化する(fsec1... 形式または 64桁HEX)
 function normalizeSecretKey(input: string): string {
@@ -111,6 +156,15 @@ function firstETag(e: NostrEvent): string | null {
   return null;
 }
 
+// Nostr 'e' タグのマーカー(marker)を返す: 'reply'|'root'|'q'|undefined。
+// NIP-10 に基づき、引用ポストは marker='q' の e タグを持つ。
+function firstETagMarker(e: NostrEvent): string | undefined {
+  for (const t of e.tags) {
+    if (t[0] === 'e' && typeof t[1] === 'string' && t[1]) return t[2];
+  }
+  return undefined;
+}
+
 // Nostr 投稿(テキスト)を最新順に並べる。同時刻は id で安定ソート。
 function sortNostrDesc(posts: NostrEvent[]): NostrEvent[] {
   return [...posts].sort((a, b) => {
@@ -141,6 +195,35 @@ function aggregateNostrReactions(list: NostrEvent[] | undefined, selfPubkeyHex: 
     m.set(emoji, cur);
   }
   return [...m.entries()].map(([emoji, v]) => ({ emoji, ...v }));
+}
+
+// Nostr 投稿に含まれる画像 URL を取り出す。
+// 優先: NIP-92 の imeta タグ。無ければ本文中の http(s) 画像 URL から抽出する。
+function nostrImageUrls(e: NostrEvent): { url: string; mime?: string }[] {
+  const urls: { url: string; mime?: string }[] = [];
+  for (const tag of e.tags) {
+    if (tag[0] === 'imeta') {
+      const entry = { url: '', mime: undefined as string | undefined };
+      for (let i = 1; i < tag.length; i++) {
+        if (tag[i] === 'url' && tag[i + 1]) entry.url = tag[i + 1];
+        else if (tag[i] === 'm' && tag[i + 1]) entry.mime = tag[i + 1];
+      }
+      if (entry.url) urls.push(entry);
+    }
+  }
+  if (urls.length > 0) return urls;
+  // 本文中の画像 URL(拡張子判定)を抽出
+  const IMG_URL_RE = /https?:\/\/[^\s<>"]+\.(?:png|jpe?g|gif|webp|avif|bmp)(?:\?[^\s<>"]*)?/gi;
+  for (const m of e.content.matchAll(IMG_URL_RE)) {
+    urls.push({ url: m[0] });
+  }
+  return urls;
+}
+
+// 本文中に含まれる画像 URL を全て取り出す(インライン画像化して URL テキストは非表示にする)
+function inlineImageUrls(content: string): string[] {
+  const IMG_URL_RE = /https?:\/\/[^\s<>"]+\.(?:png|jpe?g|gif|webp|avif|bmp)(?:\?[^\s<>"]*)?/gi;
+  return [...content.matchAll(IMG_URL_RE)].map((m) => m[0]);
 }
 
 // 文字列の SHA-256 ハッシュ(32 バイト)を計算する
@@ -366,6 +449,43 @@ function sortPostsDesc(posts: FodprEvent[]): FodprEvent[] {
   });
 }
 
+// 通知を最新順(createdAt 降順)で並べる
+function sortByCreatedAt<T extends { createdAt: number }>(list: T[]): T[] {
+  return [...list].sort((a, b) => b.createdAt - a.createdAt);
+}
+
+// 既読通知 ID 集合を localStorage から読み込む(壊れていれば空)
+function loadReadNotifIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem('prrr_notif_read');
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) return new Set(arr.filter((x): x is string => typeof x === 'string'));
+  } catch {
+    /* 壊れていれば空 */
+  }
+  return new Set();
+}
+
+// 既読通知 ID 集合を localStorage へ保存する
+function saveReadNotifIds(ids: Set<string>) {
+  try {
+    localStorage.setItem('prrr_notif_read', JSON.stringify([...ids]));
+  } catch {
+    /* 保存失敗は無視 */
+  }
+}
+
+// タイムスタンプ(秒)を「〜前」表記にする
+function relativeTime(ts: number): string {
+  const diff = Math.floor(Date.now() / 1000) - ts;
+  if (diff < 60) return 'たった今';
+  if (diff < 3600) return `${Math.floor(diff / 60)}分前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}時間前`;
+  if (diff < 86400 * 7) return `${Math.floor(diff / 86400)}日前`;
+  return new Date(ts * 1000).toLocaleDateString();
+}
+
 // pubkey(HEX)から表示名を引く: プロフィールの名前を優先、なければ先頭7桁
 function resolveDisplayName(pubkeyHex: string, profileMap: Record<string, FodprEvent>): string {
   return profileName(profileMap[pubkeyHex]) ?? pubkeyHex.slice(0, 7);
@@ -403,8 +523,405 @@ function PenIcon({ className }: { className?: string }) {
   );
 }
 
+// 通知の種類と発生元
+type NotificationSource = 'fodpr' | 'nostr';
+type NotificationType = 'react' | 'reply' | 'repost' | 'quote';
+
+// 通知1件: 誰が・どの投稿に・いつアクションしたか
+type Notification = {
+  id: string;
+  source: NotificationSource;
+  type: NotificationType;
+  senderPubkey: string;
+  targetKey: string;
+  createdAt: number;
+};
+
+// 閉じる(×)アイコン
+function CloseIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <path d="M18 6L6 18M6 6l12 12" />
+    </svg>
+  );
+}
+
+// 通知タブ(タイムラインと同じ一覧 UI)
+function NotificationsView({
+  notifications,
+  readNotifIds,
+  onMarkRead,
+  onMarkAllRead,
+  onOpenPost,
+  profileMap,
+  nostrProfileMap,
+  eventByKey,
+  nostrNoteById,
+  onOpenUser,
+  onReact,
+  onUndoReact,
+  onRepost,
+  onUndoRepost,
+  onQuote,
+  onReply,
+  onDelete,
+  selfPubkeyHex,
+  selfRepostTargets,
+  reactions,
+  // 追加: インタラクション取得用
+  replyMap,
+  nostrReplyMap,
+  links,
+  nostrRepostMap,
+  nostrReactions,
+  nostrReposts,
+  noteById,
+}: {
+  notifications: Notification[];
+  readNotifIds: Set<string>;
+  onMarkRead: (id: string) => void;
+  onMarkAllRead: () => void;
+  onOpenPost: (n: Notification) => void;
+  profileMap: Record<string, FodprEvent>;
+  nostrProfileMap: Record<string, NostrEvent>;
+  // 投稿検索用
+  eventByKey: Map<string, FodprEvent>;
+  nostrNoteById: Record<string, NostrEvent>;
+// Fodprアクション用
+  onOpenUser: (pubkeyHex: string) => void;
+  onReact: (...args: any[]) => void;
+  onUndoReact?: (...args: any[]) => void;
+  onRepost: (...args: any[]) => void;
+  onUndoRepost?: (...args: any[]) => void;
+  onQuote: (...args: any[]) => void;
+  onReply: (...args: any[]) => void;
+  onDelete: (...args: any[]) => void;
+  selfPubkeyHex: string;
+  selfRepostTargets?: Set<string>;
+  reactions?: ReactionMap;
+  // Nostr用
+  nostrReactions?: Map<string, NostrEvent[]>;
+  nostrReposts?: Map<string, NostrEvent[]>;
+  noteById?: Record<string, NostrEvent>;
+  // インタラクション取得用
+  replyMap?: ReplyMap;
+  nostrReplyMap?: Map<string, NostrEvent[]>;
+  links?: FodprEvent[];
+  nostrRepostMap?: Map<string, NostrEvent[]>;
+}) {
+  const sorted = sortByCreatedAt(notifications);
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between px-1">
+        <h2 className="text-lg font-semibold text-white">通知</h2>
+        {notifications.length > 0 && (
+          <button
+            onClick={onMarkAllRead}
+            className="rounded-full border border-white/15 px-3 py-1.5 text-xs text-gray-300 transition-colors hover:bg-white/10"
+          >
+            すべて既読
+          </button>
+        )}
+      </div>
+      {sorted.length === 0 ? (
+        <p className="pt-8 text-center text-sm text-gray-500">通知はありません</p>
+      ) : (
+        <div className="space-y-3">
+          {sorted.map((n) => {
+            const unread = !readNotifIds.has(n.id);
+            // 対象投稿を取得
+            const targetPost = n.source === 'fodpr'
+              ? eventByKey.get(n.targetKey)
+              : nostrNoteById[n.targetKey];
+            if (!targetPost) return null;
+
+            const senderName = n.source === 'fodpr'
+              ? resolveDisplayName(n.senderPubkey, profileMap)
+              : nostrDisplayName(n.senderPubkey, nostrProfileMap);
+            const typeLabel =
+              n.type === 'react' ? 'リアクション' :
+              n.type === 'reply' ? '返信' :
+              n.type === 'repost' ? 'リポスト' : '引用';
+
+            // インタラクション元のイベントを取得（返信/引用/リポスト/リアクション）
+            let interactionEvent: FodprEvent | NostrEvent | null = null;
+            if (n.source === 'fodpr') {
+              const senderPubkeyHex = n.senderPubkey;
+              if (n.type === 'reply' && replyMap) {
+                const replies = replyMap.get(n.targetKey) ?? [];
+                interactionEvent = replies.find((e) => CryptoUtils.bytesToHex(e.pubkey) === senderPubkeyHex) ?? null;
+              } else if (n.type === 'quote' && links) {
+                interactionEvent = links.find((e) => {
+                  const qt = quoteTargetOf(e);
+                  return qt === n.targetKey && CryptoUtils.bytesToHex(e.pubkey) === senderPubkeyHex;
+                }) ?? null;
+              } else if (n.type === 'repost' && links) {
+                interactionEvent = links.find((e) => {
+                  const rt = repostTarget(e);
+                  return rt === n.targetKey && quoteTargetOf(e) === null && CryptoUtils.bytesToHex(e.pubkey) === senderPubkeyHex;
+                }) ?? null;
+              } else if (n.type === 'react' && reactions && links) {
+                const reacts = reactions.get(n.targetKey) ?? [];
+                const reacted = reacts.find((r) => r.pubkey === senderPubkeyHex);
+                if (reacted) {
+                  // リアクションイベント自体を探す
+                  const reactEvents = links.filter((e) => {
+                    const rt = reactionTarget(e);
+                    return rt === n.targetKey && CryptoUtils.bytesToHex(e.pubkey) === senderPubkeyHex && e.content === reacted.emoji;
+                  });
+                  interactionEvent = reactEvents[0] ?? null;
+                }
+              }
+            } else {
+              const senderPubkey = n.senderPubkey;
+              if (n.type === 'reply' && nostrReplyMap) {
+                const replies = nostrReplyMap.get(n.targetKey) ?? [];
+                interactionEvent = replies.find((e) => e.pubkey === senderPubkey && firstETagMarker(e) !== 'q') ?? null;
+              } else if (n.type === 'quote' && nostrReplyMap) {
+                const quotes = nostrReplyMap.get(n.targetKey) ?? [];
+                interactionEvent = quotes.find((e) => e.pubkey === senderPubkey && firstETagMarker(e) === 'q') ?? null;
+              } else if (n.type === 'repost' && nostrRepostMap) {
+                const reposts = nostrRepostMap.get(n.targetKey) ?? [];
+                interactionEvent = reposts.find((e) => e.pubkey === senderPubkey) ?? null;
+              } else if (n.type === 'react' && nostrReactions) {
+                const reacts = nostrReactions.get(n.targetKey) ?? [];
+                interactionEvent = reacts.find((e) => e.pubkey === senderPubkey) ?? null;
+              }
+            }
+
+            return (
+              <div key={n.id} className="space-y-2">
+                {/* 通知ヘッダー */}
+                <div className={`rounded-xl border px-3 py-2 text-sm ${
+                  unread ? 'border-primary/40 bg-primary/5' : 'border-white/10 bg-black/20'
+                }`}>
+                  <div className="flex items-center gap-2">
+                    <span className={'h-2 w-2 shrink-0 rounded-full ' + (unread ? 'bg-primary' : 'bg-transparent')} />
+                    <span className="font-medium text-white">{senderName}</span>
+                    <span className="text-gray-400"> が </span>
+                    <span className="font-medium text-primary">{typeLabel}</span>
+                    <span className="text-gray-400"> しました</span>
+                    <span className="ml-auto text-xs text-gray-500">{relativeTime(n.createdAt)}</span>
+                  </div>
+                  <button
+                    onClick={() => {
+                      onMarkRead(n.id);
+                      onOpenPost(n);
+                    }}
+                    className="mt-1 text-xs text-primary hover:underline"
+                  >
+                    既読にする
+                  </button>
+                </div>
+                {/* 対象投稿＋インタラクションをスレッド風に表示 */}
+                {n.source === 'fodpr' ? (
+                  <>
+                    <PostCard
+                      e={targetPost as FodprEvent}
+                      profileMap={profileMap}
+                      eventByKey={eventByKey}
+                      reactions={reactions!.get(dedupeKey(targetPost as FodprEvent))}
+                      selfPubkeyHex={selfPubkeyHex}
+                      selfRepostTargets={selfRepostTargets!}
+                      onOpenUser={onOpenUser}
+                      onReact={onReact}
+                      onUndoReact={onUndoReact!}
+                      onRepost={onRepost}
+                      onUndoRepost={onUndoRepost!}
+                      onQuote={onQuote}
+                      onReply={onReply}
+                      onDelete={onDelete}
+                    />
+                    {interactionEvent && (
+                      <div className="ml-3 mt-2 border-l-2 border-primary/30 pl-3 space-y-2">
+                        <div className="flex items-center gap-1.5 text-xs text-primary">
+                          <ReplyIcon className="h-3 w-3" />
+                          <span>上記の投稿への{typeLabel}</span>
+                        </div>
+                        <PostCard
+                          e={interactionEvent as FodprEvent}
+                          profileMap={profileMap}
+                          eventByKey={eventByKey}
+                          reactions={reactions!.get(dedupeKey(interactionEvent as FodprEvent))}
+                          selfPubkeyHex={selfPubkeyHex}
+                          selfRepostTargets={selfRepostTargets!}
+                          onOpenUser={onOpenUser}
+                          onReact={onReact}
+                          onUndoReact={onUndoReact!}
+                          onRepost={onRepost}
+                          onUndoRepost={onUndoRepost!}
+                          onQuote={onQuote}
+                          onReply={onReply}
+                          onDelete={onDelete}
+                          embedded={true}
+                        />
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <NostrNoteCard
+                      e={targetPost as NostrEvent}
+                      profileMap={nostrProfileMap}
+                      reactions={nostrReactions?.get((targetPost as NostrEvent).id)}
+                      reposts={nostrReposts?.get((targetPost as NostrEvent).id)}
+                      selfPubkeyHex={selfPubkeyHex}
+                      loggedIn={!!selfPubkeyHex}
+                      onOpenUser={onOpenUser}
+                      onReact={onReact}
+                      onRepost={onRepost}
+                      onQuote={onQuote}
+                      onReply={onReply}
+                      onDelete={onDelete}
+                      noteById={noteById}
+                    />
+                    {interactionEvent && (
+                      <div className="ml-3 mt-2 border-l-2 border-primary/30 pl-3 space-y-2">
+                        <div className="flex items-center gap-1.5 text-xs text-primary">
+                          <ReplyIcon className="h-3 w-3" />
+                          <span>上記の投稿への{typeLabel}</span>
+                        </div>
+                        <NostrNoteCard
+                          e={interactionEvent as NostrEvent}
+                          profileMap={nostrProfileMap}
+                          reactions={nostrReactions?.get((interactionEvent as NostrEvent).id)}
+                          reposts={nostrReposts?.get((interactionEvent as NostrEvent).id)}
+                          selfPubkeyHex={selfPubkeyHex}
+                          loggedIn={!!selfPubkeyHex}
+                          onOpenUser={onOpenUser}
+                          onReact={onReact}
+                          onRepost={onRepost}
+                          onQuote={onQuote}
+                          onReply={onReply}
+                          onDelete={onDelete}
+                          noteById={noteById}
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 通知クリック時に表示する対象投稿のオーバーレイ
+function NotifPostViewer({
+  post,
+  source,
+  onClose,
+  onOpenUser,
+}: {
+  post: FodprEvent | NostrEvent;
+  source: NotificationSource;
+  onClose: () => void;
+  onOpenUser: (pubkeyHex: string) => void;
+}) {
+  const pkHex = source === 'fodpr' ? CryptoUtils.bytesToHex((post as FodprEvent).pubkey) : (post as NostrEvent).pubkey;
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-bg/95 backdrop-blur-sm p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-lg overflow-hidden rounded-2xl border border-white/15 bg-[#0d1422]/95 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+          <span className="text-sm font-semibold text-white">通知の投稿</span>
+          <button
+            onClick={onClose}
+            aria-label="閉じる"
+            title="閉じる"
+            className="rounded-full p-1 text-gray-300 transition-colors hover:bg-white/10"
+          >
+            <CloseIcon className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="space-y-3 p-4">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => {
+                onOpenUser(pkHex);
+                onClose();
+              }}
+              className="flex min-w-0 items-center gap-2 text-left"
+            >
+              <Avatar
+                picture={null}
+                pubkeyHex={pkHex}
+                name={pkHex.slice(0, 7)}
+                className="h-10 w-10 text-sm"
+              />
+              <span className="truncate font-medium text-white">{pkHex.slice(0, 7)}</span>
+            </button>
+            {source === 'nostr' && (
+              <span className="text-xs text-gray-400">{new Date((post as NostrEvent).created_at * 1000).toLocaleString()}</span>
+            )}
+            {source === 'fodpr' && (
+              <span className="text-xs text-gray-400">{new Date((post as FodprEvent).createdAt * 1000).toLocaleString()}</span>
+            )}
+          </div>
+          {source === 'nostr' && (
+            <>
+              <p className="whitespace-pre-wrap break-words text-gray-100">
+                {renderCustomEmojis((post as NostrEvent).content, parseNostrEmojiTags((post as NostrEvent).tags))}
+              </p>
+              {(post as NostrEvent).kind === 1 &&
+                nostrImageUrls(post as NostrEvent).length > 0 &&
+                nostrImageUrls(post as NostrEvent).map((img, i) => (
+                  <img
+                    key={i}
+                    src={img.url}
+                    alt=""
+                    loading="lazy"
+                    className="max-h-96 w-auto max-w-full rounded-xl"
+                  />
+                ))}
+            </>
+          )}
+          {source === 'fodpr' && (
+            <>
+              <p className="whitespace-pre-wrap break-words text-gray-100">
+                {renderCustomEmojis((post as FodprEvent).content, parseFodprEmojiTags((post as FodprEvent).tags))}
+              </p>
+              {(post as FodprEvent).transType === TransTypeBinary &&
+                (() => {
+                  const media = parseImageContent((post as FodprEvent).content);
+                  if (!media) return null;
+                  return (
+                    <img
+                      src={`data:${media.mime};base64,${media.base64}`}
+                      alt=""
+                      loading="lazy"
+                      className="max-h-96 w-auto max-w-full rounded-xl"
+                    />
+                  );
+                })()}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const NAV_ITEMS = [
   { id: 'timeline', label: 'タイムライン' },
+  { id: 'notifications', label: '通知' },
   { id: 'profile', label: 'プロフィール' },
   { id: 'settings', label: '設定' },
 ] as const;
@@ -414,6 +931,7 @@ type ViewId = (typeof NAV_ITEMS)[number]['id'];
 // Nostr タブのナビメニュー(タイムライン + プロフィール + 設定)
 const NOSTR_NAV_ITEMS = [
   { id: 'timeline', label: 'タイムライン' },
+  { id: 'notifications', label: '通知' },
   { id: 'profile', label: 'プロフィール' },
   { id: 'settings', label: '設定' },
 ] as const;
@@ -594,7 +1112,24 @@ function App() {
 
   // モバイル用の中大モーダル投稿欄(既定は非表示)
   const [mobileComposerOpen, setMobileComposerOpen] = useState(false);
+  // 既読通知ID集合(localStorage永続化)
+  const [readNotifIds, setReadNotifIds] = useState<Set<string>>(() => loadReadNotifIds());
+  // 通知から対象投稿をオーバーレイ表示用
+  const [notifPost, setNotifPost] = useState<{ post: FodprEvent | NostrEvent; source: 'fodpr' | 'nostr' } | null>(null);
   const isSm = useIsSm();
+
+  // 背景テーマ(localStorage 永続化)。設定画面で切り替える
+  // 背景テーマ(localStorage 永続化)。設定画面で切り替える
+  // 'photo' は旧キー名(→ 'modern')としても読み込み互換する
+  const [theme, setTheme] = useState<ThemeId>(() => {
+    const saved = localStorage.getItem(THEME_STORAGE_KEY);
+    return saved === 'modern' || saved === 'photo' ? 'modern' : 'aurora';
+  });
+
+  function changeTheme(next: ThemeId) {
+    setTheme(next);
+    localStorage.setItem(THEME_STORAGE_KEY, next);
+  }
 
   // クライアント実装ドキュメントページを新しいタブで開く
   function openDocs() {
@@ -655,6 +1190,9 @@ function App() {
   // Nostr 返信モード中の対象イベント { id, pubkey }
   const [nostrReplyTarget, setNostrReplyTarget] = useState<{ id: string; pubkey: string } | null>(null);
 
+  // Nostr 引用モード中の対象イベント { id, pubkey }(非 null ならコンポーザが引用モード)
+  const [nostrQuoteTarget, setNostrQuoteTarget] = useState<{ id: string; pubkey: string } | null>(null);
+
   // コンポーザ入力
   const [noteText, setNoteText] = useState('');
   const [name, setName] = useState('');
@@ -666,6 +1204,96 @@ function App() {
 
   // リプライ中の対象イベントの dedupeKey(非 null ならコンポーザが返信モード)
   const [replyTarget, setReplyTarget] = useState<string | null>(null);
+
+  // PWA 更新検知用
+  const [pwaUpdateAvailable, setPwaUpdateAvailable] = useState(false);
+  // 画像タップでのオーバーレイ表示(Fodpr・Nostr 共通)
+  const [imageOverlayUrl, setImageOverlayUrl] = useState<string | null>(null);
+
+  // PWA 更新検知
+  // - sw.js は install 時に skipWaiting するため、新 SW が適用されると
+  //   controllerchange が発生する。初回の claim(初めてコントロールされた時)は
+  //   「更新」ではないので誤判定しない。
+  // - 起動時と 60 秒ごとに reg.update() で新バージョンを確認する。
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    let hadController = !!navigator.serviceWorker.controller;
+    const onControllerChange = () => {
+      if (hadController) setPwaUpdateAvailable(true);
+      hadController = true;
+    };
+    navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
+    const checkUpdate = () => {
+      navigator.serviceWorker
+        .getRegistrations()
+        .then((regs) => {
+          for (const reg of regs) reg.update().catch(() => {});
+        })
+        .catch(() => {});
+    };
+    checkUpdate();
+    const timer = window.setInterval(checkUpdate, 60_000);
+    return () => {
+      navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  // PWA 更新適用
+  function applyPwaUpdate() {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then((regs) => {
+        regs.forEach((reg) => reg.unregister());
+      });
+      window.location.reload();
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // ブラウザ通知(Notification API)
+  // 自分の投稿へ新着返信/リアクション/リポスト/引用が来たら、タブが背面のときに
+  // OS の通知枠でお知らせする。設定でオン/オフし、localStorage に保存する。
+  // ────────────────────────────────────────────────────────────────────────
+  const [browserNotifEnabled, setBrowserNotifEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(BROWSER_NOTIF_STORAGE_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [notifPermission, setNotifPermission] = useState<NotificationPermission>(
+    () => (typeof Notification !== 'undefined' ? Notification.permission : 'default'),
+  );
+  // バーンダウン防止: 一度ブラウザ通知を飛ばした通知 id を記憶する。
+   // ページリロード後も再通知しないよう localStorage へ永続化する。
+   const notifiedIdsRef = useRef<Set<string>>(loadNotifiedIds());
+
+   // 設定でオンにしたタイミングで権限をリクエストする
+   function setBrowserNotifsEnabled(next: boolean) {
+     setBrowserNotifEnabled(next);
+     try {
+       localStorage.setItem(BROWSER_NOTIF_STORAGE_KEY, next ? '1' : '0');
+     } catch {
+       /* ignore */
+     }
+   }
+
+   async function requestNotificationPermission() {
+     if (typeof Notification === 'undefined') return;
+     const p = await Notification.requestPermission();
+     setNotifPermission(p);
+     if (p === 'granted') setBrowserNotifsEnabled(true);
+     else setBrowserNotifEnabled(false);
+   }
+
+   // ページロード直後に権限状況を同期(ユーザーがブラウザ設定で許可していた場合も反映)
+   useEffect(() => {
+     if (typeof Notification === 'undefined') return;
+     setNotifPermission(Notification.permission);
+     if (Notification.permission === 'granted' && !browserNotifEnabled) setBrowserNotifsEnabled(true);
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, []);
+
 
   // 画像/動画/ファイル投稿(Binary)用の添付状態
   const [mediaDataUrl, setMediaDataUrl] = useState<string | null>(null);
@@ -715,6 +1343,11 @@ function App() {
         try {
           getPublicKeyFromSecret(nhex); // 不正な鍵はログインしない
           setNostrPrivKey(nhex);
+          // fsec なし + nsec のみでゲストモードに入っていた場合、リロード後も復元する
+          if (!hex && localStorage.getItem(NOSTR_GUEST_STORAGE_KEY) === '1') {
+            setGuestMode(true);
+            setActiveTab('nostr');
+          }
         } catch {
           setNostrPrivKey(null);
         }
@@ -892,6 +1525,12 @@ function App() {
     [nostrAllEvents, nostrDeletedIds],
   );
 
+  // インラインノート参照(nostr:note1...)のプレビュー用: id → イベントの引きテーブル
+  const nostrNoteById = useMemo(
+    () => Object.fromEntries(nostrNotes.map((n) => [n.id, n])),
+    [nostrNotes],
+  );
+
   // kind 7 リアクション / kind 6 リポスト / kind 1 リプライを対象イベント id ごとに束ねる
   // (kind 5 で削除されたイベントは集計から除外する)
   const nostrReactionMap = useMemo(() => {
@@ -932,6 +1571,260 @@ function App() {
     }
     return m;
   }, [nostrAllEvents, nostrDeletedIds]);
+
+  // ────────────────────────────────────────────────────────────────────────
+  // 通知の導出
+  // 自分の投稿(Fodpr=dedupeKey / Nostr=note id)を対象にした
+  // リアクション・返信・リポスト・引用を通知として組み立てる。
+  // ────────────────────────────────────────────────────────────────────────
+  // 自分の Fodpr 投稿の dedupeKey 集合
+  const myFodprKeys = useMemo(() => {
+    const s = new Set<string>();
+    if (!pubkeyHex) return s;
+    for (const e of allEvents) {
+      if (CryptoUtils.bytesToHex(e.pubkey) === pubkeyHex) {
+        if (e.transType === TransTypeJSON) {
+          try {
+            const obj = JSON.parse(e.content);
+            if (obj?.mode === 'profile') continue;
+          } catch {
+            /* profile 判定失敗は投稿として扱う */
+          }
+        }
+        s.add(dedupeKey(e));
+      }
+    }
+    return s;
+  }, [allEvents, pubkeyHex]);
+
+  // 自分の Nostr 投稿(kind 1)のイベント id 集合
+  const myNostrNoteIds = useMemo(() => {
+    const s = new Set<string>();
+    if (!nostrPubkeyHex) return s;
+    for (const e of nostrAllEvents) {
+      if (e.kind === 1 && e.pubkey === nostrPubkeyHex) s.add(e.id);
+    }
+    return s;
+  }, [nostrAllEvents, nostrPubkeyHex]);
+
+  // 通知一覧(最新順)
+  const notifications = useMemo<Notification[]>(() => {
+    const out: Notification[] = [];
+    // Fodpr: リアクション
+    for (const [targetKey, items] of reactionMap) {
+      if (!myFodprKeys.has(targetKey)) continue;
+      for (const r of items) {
+        if (r.pubkey === pubkeyHex) continue;
+        out.push({
+          id: `f:react:${targetKey}:${r.pubkey}:${r.emoji}`,
+          source: 'fodpr',
+          type: 'react',
+          senderPubkey: r.pubkey,
+          targetKey,
+          createdAt: 0,
+        });
+      }
+    }
+    // Fodpr: 返信
+    for (const [targetKey, list] of replyMap) {
+      if (!myFodprKeys.has(targetKey)) continue;
+      for (const e of list) {
+        const pk = CryptoUtils.bytesToHex(e.pubkey);
+        if (pk === pubkeyHex) continue;
+        out.push({
+          id: `f:reply:${targetKey}:${dedupeKey(e)}`,
+          source: 'fodpr',
+          type: 'reply',
+          senderPubkey: pk,
+          targetKey,
+          createdAt: e.createdAt,
+        });
+      }
+    }
+    // Fodpr: リポスト/引用
+    for (const e of links) {
+      const t = repostTarget(e);
+      if (!t || !myFodprKeys.has(t)) continue;
+      const pk = CryptoUtils.bytesToHex(e.pubkey);
+      if (pk === pubkeyHex) continue;
+      const isQuote = quoteTargetOf(e) !== null;
+      out.push({
+        id: `f:${isQuote ? 'quote' : 'repost'}:${t}:${dedupeKey(e)}`,
+        source: 'fodpr',
+        type: isQuote ? 'quote' : 'repost',
+        senderPubkey: pk,
+        targetKey: t,
+        createdAt: e.createdAt,
+      });
+    }
+    // Nostr: リアクション(kind 7)
+    for (const [targetId, list] of nostrReactionMap) {
+      if (!myNostrNoteIds.has(targetId)) continue;
+      for (const e of list) {
+        if (e.pubkey === nostrPubkeyHex) continue;
+        out.push({
+          id: `n:react:${targetId}:${e.id}`,
+          source: 'nostr',
+          type: 'react',
+          senderPubkey: e.pubkey,
+          targetKey: targetId,
+          createdAt: e.created_at,
+        });
+      }
+    }
+    // Nostr: 返信/引用(kind 1、marker='q' は引用)
+    for (const [targetId, list] of nostrReplyMap) {
+      if (!myNostrNoteIds.has(targetId)) continue;
+      for (const e of list) {
+        if (e.pubkey === nostrPubkeyHex) continue;
+        const isQuote = firstETagMarker(e) === 'q';
+        out.push({
+          id: `n:${isQuote ? 'quote' : 'reply'}:${targetId}:${e.id}`,
+          source: 'nostr',
+          type: isQuote ? 'quote' : 'reply',
+          senderPubkey: e.pubkey,
+          targetKey: targetId,
+          createdAt: e.created_at,
+        });
+      }
+    }
+    // Nostr: リポスト(kind 6)
+    for (const [targetId, list] of nostrRepostMap) {
+      if (!myNostrNoteIds.has(targetId)) continue;
+      for (const e of list) {
+        if (e.pubkey === nostrPubkeyHex) continue;
+        out.push({
+          id: `n:repost:${targetId}:${e.id}`,
+          source: 'nostr',
+          type: 'repost',
+          senderPubkey: e.pubkey,
+          targetKey: targetId,
+          createdAt: e.created_at,
+        });
+      }
+    }
+    return sortByCreatedAt(out);
+  }, [
+    reactionMap,
+    replyMap,
+    links,
+    myFodprKeys,
+    myNostrNoteIds,
+    nostrReactionMap,
+    nostrReplyMap,
+    nostrRepostMap,
+    pubkeyHex,
+    nostrPubkeyHex,
+  ]);
+
+  // Fodpr 側 / Nostr 側それぞれの通知。各ネットワークのタブでは自分の側の通知だけを表示する
+  const fodprNotifications = useMemo(
+    () => notifications.filter((n) => n.source === 'fodpr'),
+    [notifications],
+  );
+  const nostrNotifications = useMemo(
+    () => notifications.filter((n) => n.source === 'nostr'),
+    [notifications],
+  );
+  const activeNotifications = activeTab === 'fodpr' ? fodprNotifications : nostrNotifications;
+
+  // 通知種別の日本語ラベル
+  const typeLabels: Record<NotificationType, string> = {
+    react: 'リアクション',
+    reply: '返信',
+    repost: 'リポスト',
+    quote: '引用',
+  };
+
+  // 新着未読通知が来たらブラウザ通知を飛ばす(タブが背面のとき重点的に)
+  useEffect(() => {
+    if (!browserNotifEnabled || notifPermission !== 'granted') return;
+    const seen = notifiedIdsRef.current;
+    let fired = false;
+    let changed = false;
+    for (const n of notifications) {
+      if (seen.has(n.id)) continue;
+      // 未読かつ最前面で通知タブを開いていない場合のみ飛ばす
+      let shouldFire = false;
+      if (!readNotifIds.has(n.id)) {
+        const onNotifView =
+          view === 'notifications' && activeTab === (n.source === 'fodpr' ? 'fodpr' : 'nostr');
+        shouldFire = document.hidden || !onNotifView;
+      }
+      // 一度飛ばした/既読でも id は記憶して再通知しない
+      seen.add(n.id);
+      changed = true;
+      if (!shouldFire) continue;
+      const name =
+        n.source === 'fodpr'
+          ? resolveDisplayName(n.senderPubkey, profileMap)
+          : nostrDisplayName(n.senderPubkey, nostrProfileMap);
+      try {
+        new Notification(n.source === 'fodpr' ? 'Fodpr 通知' : 'Nostr 通知', {
+          body: `${name} が${typeLabels[n.type]}しました`,
+          tag: n.id,
+          icon: '/icon-192.png',
+        });
+        fired = true;
+      } catch {
+        /* ignore */
+      }
+    }
+    // 永続化(サイズが大きくなりすぎないよう古いものをトリム)
+    if (changed) {
+      const arr = Array.from(seen);
+      if (arr.length > 1000) {
+        for (const id of arr.slice(0, arr.length - 1000)) seen.delete(id);
+      }
+      try {
+        localStorage.setItem(NOTIF_NOTIFIED_STORAGE_KEY, JSON.stringify(Array.from(seen)));
+      } catch {
+        /* ignore */
+      }
+    }
+    // 一度でも通知を飛ばしたなら未読バッジ数を更新
+    if (fired && typeof navigator !== 'undefined' && 'setAppBadge' in navigator) {
+      try {
+        void (navigator as any).setAppBadge(
+          notifications.filter((n) => !readNotifIds.has(n.id)).length || 1,
+        );
+      } catch {
+        /* ignore */
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [notifications, browserNotifEnabled, notifPermission, readNotifIds, view, activeTab]);
+
+  // 通知を既読にする(タップ/クリック時)
+  function markRead(id: string) {
+    setReadNotifIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      saveReadNotifIds(next);
+      return next;
+    });
+  }
+
+  // すべて既読にする(表示中のネットワーク側の通知のみ)
+  function markAllRead() {
+    setReadNotifIds((prev) => {
+      const next = new Set(prev);
+      for (const n of activeNotifications) next.add(n.id);
+      saveReadNotifIds(next);
+      return next;
+    });
+  }
+
+  // 通知から対象投稿を開く(NotifPostViewer オーバーレイ)
+  function openNotificationPost(n: Notification) {
+    if (n.source === 'fodpr') {
+      const post = eventByKey.get(n.targetKey);
+      if (post) setNotifPost({ post, source: 'fodpr' });
+    } else {
+      const post = nostrAllEvents.find((e) => e.id === n.targetKey);
+      if (post) setNotifPost({ post, source: 'nostr' });
+    }
+  }
 
   // 接続確立後に一度 REQ(All) して保存済みイベントを取得する(再接続・リレー変更時にも再送)
   useEffect(() => {
@@ -1043,8 +1936,9 @@ function App() {
   // NIP-65 の read マーカーがあれば read リレーだけから読み込む。
   useEffect(() => {
     if (!nostrRelay.connected) return;
-    const t = setTimeout(() => {
-      const filters = [{ kinds: [0, 1, 5, 6, 7], limit: 300 }];
+const t = setTimeout(() => {
+        // limit を大きくして過去のイベントも含めて取得（通知用）
+        const filters = [{ kinds: [0, 1, 5, 6, 7], limit: 10000 }];
       const readTargets =
         nostrRelayList && (nostrRelayList.read.length > 0 || nostrRelayList.both.length > 0)
           ? [...nostrRelayList.read, ...nostrRelayList.both]
@@ -1061,6 +1955,42 @@ function App() {
     }, 300);
     return () => clearTimeout(t);
   }, [nostrRelay.connected, nostrRelay.sendReq, nostrRelay.sendReqTo, nostrRelayList]);
+
+  // タイムラインに登場した pubkey の kind 0(プロフィール)を未取得分だけ取得する。
+  // メイン購読の limit で kind 0 が取り切れないことがあるため、authors 指定で補完する。
+  const nostrProfileRequestedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!nostrRelay.connected) return;
+    if (nostrAllEvents.length === 0) return;
+    const wanted = new Set<string>();
+    for (const e of nostrAllEvents) {
+      if (e.kind !== 1 && e.kind !== 6 && e.kind !== 7) continue;
+      if (nostrProfileMap[e.pubkey]) continue;
+      if (nostrProfileRequestedRef.current.has(e.pubkey)) continue;
+      wanted.add(e.pubkey);
+    }
+    const pending = [...wanted];
+    if (pending.length === 0) return;
+    for (const p of pending) nostrProfileRequestedRef.current.add(p);
+    // 100 件ずつに分けて REQ する
+    const readTargets =
+      nostrRelayList && (nostrRelayList.read.length > 0 || nostrRelayList.both.length > 0)
+        ? [...nostrRelayList.read, ...nostrRelayList.both]
+        : null;
+    for (let i = 0; i < pending.length; i += 100) {
+      const chunk = pending.slice(i, i + 100);
+      const filters = [{ kinds: [0], authors: chunk }];
+      try {
+        if (readTargets) {
+          nostrRelay.sendReqTo(readTargets, 'nostr_kind0_' + Date.now() + '_' + i, filters);
+        } else {
+          nostrRelay.sendReq('nostr_kind0_' + Date.now() + '_' + i, filters);
+        }
+      } catch {
+        /* 未接続中は無視 */
+      }
+    }
+  }, [nostrAllEvents, nostrProfileMap, nostrRelay.connected, nostrRelay.sendReq, nostrRelay.sendReqTo, nostrRelayList]);
 
   // 署名済み Nostr イベントを送信し、自フィードに即時反映する。
   // NIP-65 の write マーカーがあれば write リレーだけへ送る。
@@ -1234,7 +2164,10 @@ function App() {
     if (quoteTarget) {
       if (!content) return;
       const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(content));
-      sendSignedEvent(TransTypeString, content, sig, [`quote:${quoteTarget}`]);
+      sendSignedEvent(TransTypeString, content, sig, [
+        `quote:${quoteTarget}`,
+        ...buildFodprEmojiTags(content),
+      ]);
       setNoteText('');
       setQuoteTarget(null);
       // 投稿後は入力欄を閉じる(デスクトップは表示を維持、モバイルはモーダルを閉じる)
@@ -1247,7 +2180,10 @@ function App() {
     if (replyTarget) {
       if (!content) return;
       const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(content));
-      sendSignedEvent(TransTypeString, content, sig, [`reply:${replyTarget}`]);
+      sendSignedEvent(TransTypeString, content, sig, [
+        `reply:${replyTarget}`,
+        ...buildFodprEmojiTags(content),
+      ]);
       setNoteText('');
       setReplyTarget(null);
       // 投稿後は入力欄を閉じる(デスクトップは表示を維持、モバイルはモーダルを閉じる)
@@ -1277,6 +2213,7 @@ function App() {
         `caption:${caption}`,
         `filename:${mediaName}`,
         `mediatype:${mediaType}`,
+        ...buildFodprEmojiTags(caption),
       ];
       sendSignedEvent(TransTypeBinary, mediaContent, sig, tags);
       setNoteText('');
@@ -1296,7 +2233,7 @@ function App() {
 
     if (!content) return;
     const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(content));
-    sendSignedEvent(TransTypeString, content, sig);
+    sendSignedEvent(TransTypeString, content, sig, buildFodprEmojiTags(content));
     setNoteText('');
     // 投稿後は入力欄を閉じる(デスクトップは表示を維持、モバイルはモーダルを閉じる)
     setMobileComposerOpen(false);
@@ -1384,6 +2321,7 @@ function App() {
     if (!privKey) {
       setGuestMode(true);
       setActiveTab('nostr');
+      localStorage.setItem(NOSTR_GUEST_STORAGE_KEY, '1');
     }
   }
 
@@ -1393,6 +2331,9 @@ function App() {
     setNostrPrivKey(null);
     setNostrLocalEvents([]);
     setNostrOpenPubkey(null);
+    setNostrReplyTarget(null);
+    setNostrQuoteTarget(null);
+    localStorage.removeItem(NOSTR_GUEST_STORAGE_KEY);
     // fsec も無ければログイン画面へ戻す
     if (!privKey) setGuestMode(false);
   }
@@ -1400,6 +2341,7 @@ function App() {
   // 鍵なしで閲覧だけ入る
   function handleGuest() {
     setGuestMode(true);
+    localStorage.removeItem(NOSTR_GUEST_STORAGE_KEY);
   }
 
   // 自分のリアクションを取り消す(該当イベントを DEL)
@@ -1423,12 +2365,22 @@ function App() {
     }
   }
 
-  // Nostr テキスト投稿(kind 1)。replyTarget があれば返信タグを付ける
-  async function handleNostrPost(text: string, replyTarget?: { id: string; pubkey: string } | null) {
+  // Nostr テキスト投稿(kind 1)。replyTarget があれば返信タグ、quoteTarget があれば引用タグ(marker='q')を付ける。
+  // content 内の :shortcode: に対応する NIP-30 の emoji タグも付与する。
+  async function handleNostrPost(
+    text: string,
+    replyTarget?: { id: string; pubkey: string } | null,
+    quoteTarget?: { id: string; pubkey: string } | null,
+  ) {
     if (!nostrPrivKey) return;
     const content = text.trim();
     if (!content) return;
-    const tags: NostrTags = replyTarget ? buildReplyTags(replyTarget.id, replyTarget.pubkey) : [];
+    const baseTags: NostrTags = replyTarget
+      ? buildReplyTags(replyTarget.id, replyTarget.pubkey)
+      : quoteTarget
+        ? buildQuoteTags(quoteTarget.id, quoteTarget.pubkey)
+        : [];
+    const tags = [...baseTags, ...buildNostrEmojiTags(content)];
     const ev = makeNostrEvent(nostrPubkeyHex, Math.floor(Date.now() / 1000), 1, tags, content);
     const signed = await signEventAsync(nostrPrivKey, ev);
     nostrPublish(signed);
@@ -1562,6 +2514,7 @@ function App() {
     if (!privKey) {
       setGuestMode(true);
       setActiveTab('nostr');
+      localStorage.setItem(NOSTR_GUEST_STORAGE_KEY, '1');
     }
   }
 
@@ -1588,7 +2541,7 @@ function App() {
   if (!ready) {
     return (
       <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-bg text-gray-400">
-        <div className="aurora" aria-hidden="true" />
+        <ThemeBackground theme={theme} />
         <p className="relative z-10 text-sm">読み込み中...</p>
       </div>
     );
@@ -1598,6 +2551,7 @@ function App() {
   if (!privKey && !guestMode) {
     return (
       <LoginScreen
+        theme={theme}
         onLogin={handleLogin}
         onGenerate={handleGenerate}
         onNostrLogin={handleNostrLogin}
@@ -1637,6 +2591,8 @@ function App() {
     setQuoteTarget(null);
     setReplyTarget(null);
     setNostrOpenPubkey(null);
+    setNostrReplyTarget(null);
+    setNostrQuoteTarget(null);
   }
 
   // Nostr タブではタイムライン + プロフィール + 設定(リレー管理)のみ表示する。
@@ -1654,12 +2610,12 @@ function App() {
 
   return (
     <div className="relative h-svh h-[100dvh] overflow-hidden bg-bg text-gray-100">
-      <div className="aurora" aria-hidden="true" />
+      <ThemeBackground theme={theme} />
 
-      <div className="relative z-10 flex h-full flex-col pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
+      <div className="relative z-10 flex h-full flex-col pt-[env(safe-area-inset-top)]">
         {/* ヘッダー */}
         <header className="flex flex-wrap items-center justify-center gap-2 px-3 py-2.5 sm:gap-3 sm:px-4 sm:py-3">
-          <h1 className="mr-auto shrink-0 text-2xl font-bold tracking-tight text-white/90">Fodpr</h1>
+          <h1 className="mr-auto shrink-0 text-2xl font-bold tracking-tight text-white/90">Prrr</h1>
 
           {/* ネットワーク切替: Fodpr / Nostr */}
           <LiquidGlass intensity="subtle" refractive className="liquid-glass--nav">
@@ -1810,17 +2766,67 @@ function App() {
                 />
               )}
               {!openPubkey && view === 'timeline' && (
-                <Timeline
-                  notes={notes}
-                  binaries={binaries}
-                  replies={replyMap}
-                  links={links}
-                  others={others}
-                  eventByKey={eventByKey}
+                <div className="space-y-3">
+                  {/* デスクトップ: タイムラインの先頭にテキスト投稿欄(Nostr 側と同じく上に固定) */}
+                  {isSm && privKey && !composerHidden && (
+                    <LiquidGlass intensity="subtle" refractive className="liquid-glass--card w-full">
+                      <Composer
+                        noteText={noteText}
+                        setNoteText={setNoteText}
+                        mediaDataUrl={mediaDataUrl}
+                        mediaName={mediaName}
+                        mediaSize={mediaSize}
+                        mediaError={mediaError}
+                        clearMedia={clearMedia}
+                        quoteTarget={quoteTarget}
+                        quoteEvent={quoteEvent}
+                        quoteName={quoteName}
+                        onCancelQuote={() => setQuoteTarget(null)}
+                        replyTarget={replyTarget}
+                        replyEvent={replyEvent}
+                        replyName={replyName}
+                        onCancelReply={() => setReplyTarget(null)}
+                        onPickFile={onPickFile}
+                        onSubmit={postNote}
+                        relayConnected={relay.connected}
+                        mediaType={mediaType}
+                        mediaThumbnail={mediaThumbnail}
+                      />
+                    </LiquidGlass>
+                  )}
+                  <Timeline
+                    notes={notes}
+                    binaries={binaries}
+                    replies={replyMap}
+                    links={links}
+                    others={others}
+                    eventByKey={eventByKey}
+                    profileMap={profileMap}
+                    reactions={reactionMap}
+                    selfPubkeyHex={pubkeyHex}
+                    selfRepostTargets={selfRepostTargets}
+                    onOpenUser={setOpenPubkey}
+                    onReact={handleReact}
+                    onUndoReact={handleUndoReact}
+                    onRepost={handleRepost}
+                    onUndoRepost={handleUndoRepost}
+                    onQuote={startQuote}
+                    onReply={startReply}
+                    onDelete={deleteEvent}
+                  />
+                </div>
+              )}
+              {view === 'notifications' && (
+                <NotificationsView
+                  notifications={fodprNotifications}
+                  readNotifIds={readNotifIds}
+                  onMarkRead={markRead}
+                  onMarkAllRead={markAllRead}
+                  onOpenPost={openNotificationPost}
                   profileMap={profileMap}
-                  reactions={reactionMap}
-                  selfPubkeyHex={pubkeyHex}
-                  selfRepostTargets={selfRepostTargets}
+                  nostrProfileMap={nostrProfileMap}
+                  eventByKey={eventByKey}
+                  nostrNoteById={nostrNoteById}
                   onOpenUser={setOpenPubkey}
                   onReact={handleReact}
                   onUndoReact={handleUndoReact}
@@ -1829,6 +2835,16 @@ function App() {
                   onQuote={startQuote}
                   onReply={startReply}
                   onDelete={deleteEvent}
+                  selfPubkeyHex={pubkeyHex}
+                  selfRepostTargets={selfRepostTargets}
+                  reactions={reactionMap}
+                  replyMap={replyMap}
+                  links={links}
+                  nostrReplyMap={nostrReplyMap}
+                  nostrRepostMap={nostrRepostMap}
+                  nostrReactions={nostrReactionMap}
+                  nostrReposts={nostrRepostMap}
+                  noteById={nostrNoteById}
                 />
               )}
               {view === 'profile' && (
@@ -1856,6 +2872,12 @@ function App() {
                   onLogout={handleLogout}
                   onShowDocs={openDocs}
                   secretHex={privKey}
+                  theme={theme}
+                  onThemeChange={changeTheme}
+                  browserNotifEnabled={browserNotifEnabled}
+                  notifPermission={notifPermission}
+                  onToggleBrowserNotif={setBrowserNotifsEnabled}
+                  onRequestNotifPermission={requestNotificationPermission}
                 />
               )}
             </>
@@ -1886,13 +2908,52 @@ function App() {
                   onReact={handleNostrReact}
                   onRepost={handleNostrRepost}
                   onReply={(id, pubkey) => setNostrReplyTarget({ id, pubkey })}
+                  onQuote={(id, pubkey) => {
+                    setNostrReplyTarget(null);
+                    setNostrQuoteTarget({ id, pubkey });
+                  }}
                   onDelete={handleNostrDelete}
                   onPost={handleNostrPost}
                   replyTarget={nostrReplyTarget}
+                  quoteTarget={nostrQuoteTarget}
                   onCancelReply={() => setNostrReplyTarget(null)}
+                  onCancelQuote={() => setNostrQuoteTarget(null)}
+                  noteById={nostrNoteById}
+                  onOpenImage={(url) => setImageOverlayUrl(url)}
                 />
               )}
-              {view === 'profile' && nostrPrivKey && (
+              {!nostrOpenPubkey && view === 'notifications' && (
+                <NotificationsView
+                  notifications={nostrNotifications}
+                  readNotifIds={readNotifIds}
+                  onMarkRead={markRead}
+                  onMarkAllRead={markAllRead}
+                  onOpenPost={openNotificationPost}
+                  profileMap={profileMap}
+                  nostrProfileMap={nostrProfileMap}
+                  eventByKey={eventByKey}
+                  nostrNoteById={nostrNoteById}
+                  onOpenUser={setNostrOpenPubkey}
+                  onReact={handleNostrReact}
+                  onRepost={handleNostrRepost}
+                  onQuote={(id, pubkey) => {
+                    setNostrReplyTarget(null);
+                    setNostrQuoteTarget({ id, pubkey });
+                  }}
+                  onReply={(id, pubkey) => setNostrReplyTarget({ id, pubkey })}
+                  onDelete={handleNostrDelete}
+                  selfPubkeyHex={nostrPubkeyHex}
+                  selfRepostTargets={new Set()} // Nostrリポスト対象の管理が異なるため空セット
+                  nostrReactions={nostrReactionMap}
+                  nostrReposts={nostrRepostMap}
+                  noteById={nostrNoteById}
+                  replyMap={replyMap}
+                  links={links}
+                  nostrReplyMap={nostrReplyMap}
+                  nostrRepostMap={nostrRepostMap}
+                />
+              )}
+              {!nostrOpenPubkey && view === 'profile' && (
                 <NostrProfileView
                   key={nostrPubkeyHex}
                   pubkeyHex={nostrPubkeyHex}
@@ -1901,7 +2962,7 @@ function App() {
                   onSave={handleNostrSaveProfile}
                 />
               )}
-               {view === 'settings' && (
+              {view === 'settings' && (
                  <NostrSettingsView
                    relayUrls={nostrRelayUrls}
                    onRelayChange={updateNostrRelays}
@@ -1910,41 +2971,13 @@ function App() {
                    onLogout={handleNostrLogout}
                    secretHex={nostrPrivKey}
                    relayList={nostrRelayList}
+                   theme={theme}
+                   onThemeChange={changeTheme}
                  />
                )}
             </>
           )}
         </main>
-
-        {/* デスクトップ: 画面下部のテキスト投稿欄(タイムラインのみ・他ユーザーのプロフィール表示中/非表示設定時は非表示) */}
-        {isSm && activeTab === 'fodpr' && view === 'timeline' && !openPubkey && privKey && !composerHidden && (
-          <footer className="px-3 sm:px-4">
-            <LiquidGlass intensity="subtle" refractive className="liquid-glass--card w-full">
-              <Composer
-                noteText={noteText}
-                setNoteText={setNoteText}
-                mediaDataUrl={mediaDataUrl}
-                mediaName={mediaName}
-                mediaSize={mediaSize}
-                mediaError={mediaError}
-                clearMedia={clearMedia}
-                quoteTarget={quoteTarget}
-                quoteEvent={quoteEvent}
-                quoteName={quoteName}
-                onCancelQuote={() => setQuoteTarget(null)}
-                replyTarget={replyTarget}
-                replyEvent={replyEvent}
-                replyName={replyName}
-                onCancelReply={() => setReplyTarget(null)}
-                onPickFile={onPickFile}
-                onSubmit={postNote}
-                relayConnected={relay.connected}
-                mediaType={mediaType}
-                mediaThumbnail={mediaThumbnail}
-              />
-            </LiquidGlass>
-          </footer>
-        )}
 
         {/* モバイル: 投稿欄は既定で非表示。右下のペン(FAB)で中央モーダルを開く */}
         {!isSm && activeTab === 'fodpr' && view === 'timeline' && !openPubkey && privKey && (
@@ -2005,6 +3038,57 @@ function App() {
             )}
           </>
         )}
+
+        {/* 通知クリックで開いた対象投稿のオーバーレイ */}
+        {notifPost &&
+          createPortal(
+            <NotifPostViewer
+              post={notifPost.post}
+              source={notifPost.source}
+              onClose={() => setNotifPost(null)}
+              onOpenUser={(pubkeyHex) => {
+                if (notifPost.source === 'fodpr') setOpenPubkey(pubkeyHex);
+                else setNostrOpenPubkey(pubkeyHex);
+              }}
+            />,
+            document.body,
+          )}
+
+        {/* PWA の新しいバージョンが利用可能になったときに表示する更新バナー */}
+        {pwaUpdateAvailable && (
+          <div className="fixed inset-x-0 bottom-4 z-50 mx-auto w-[min(26rem,calc(100vw-2rem))] rounded-2xl border border-white/15 bg-[#0d1422]/95 p-4 shadow-2xl backdrop-blur">
+            <p className="text-sm text-gray-200">新しいバージョンが利用可能です</p>
+            <div className="mt-3 flex justify-end gap-2">
+              <button
+                onClick={applyPwaUpdate}
+                className="rounded-full bg-primary px-4 py-2 text-sm font-semibold text-bg transition-colors hover:bg-primary-hover"
+              >
+                更新する
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* 画像タップオーバーレイ(Fodpr・Nostr 共通) */}
+        {imageOverlayUrl &&
+          createPortal(
+            <>
+              <button
+                className="fixed inset-0 z-40 cursor-zoom-out bg-bg/90 backdrop-blur-sm"
+                aria-label="閉じる"
+                onClick={() => setImageOverlayUrl(null)}
+              />
+              <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+                <img
+                  src={imageOverlayUrl}
+                  alt=""
+                  className="max-h-[90vh] max-w-[90vw] rounded-xl shadow-2xl"
+                  onClick={() => setImageOverlayUrl(null)}
+                />
+              </div>
+            </>,
+            document.body,
+          )}
       </div>
     </div>
   );
@@ -2106,7 +3190,11 @@ function PostCard({
                 </button>
               </div>
             )}
-            {caption && <p className="mt-2 text-lg leading-relaxed whitespace-pre-wrap break-words sm:text-xl">{caption}</p>}
+            {caption && (
+              <p className="mt-2 text-lg leading-relaxed whitespace-pre-wrap break-words sm:text-xl">
+                {renderCustomEmojis(caption, parseFodprEmojiTags(e.tags))}
+              </p>
+            )}
             {isVideo ? (
               <video
                 controls
@@ -2190,7 +3278,9 @@ function PostCard({
               </button>
             </div>
           )}
-          <p className="mt-2 text-lg leading-relaxed whitespace-pre-wrap break-words sm:text-xl">{e.content}</p>
+          <p className="mt-2 text-lg leading-relaxed whitespace-pre-wrap break-words sm:text-xl">
+            {renderCustomEmojis(e.content, parseFodprEmojiTags(e.tags))}
+          </p>
           <PostActions
             targetKey={key}
             reactions={reactions}
@@ -2340,6 +3430,11 @@ function Composer({
           >
             添付
           </button>
+          <EmojiPicker
+            onPick={(def) => {
+              if (noteRef.current) setNoteText(insertTextAtCursor(noteRef.current, `:${def.shortcode}:`));
+            }}
+          />
           <button
             onClick={() => void onSubmit()}
             disabled={
@@ -2701,7 +3796,7 @@ function SharedCard({
         </div>
         {isQuote && e.content.trim() && (
           <p className="mb-2 whitespace-pre-wrap break-words px-1 text-lg leading-relaxed text-gray-100 sm:text-xl">
-            {e.content}
+            {renderCustomEmojis(e.content, parseFodprEmojiTags(e.tags))}
           </p>
         )}
         {target ? (
@@ -2916,7 +4011,9 @@ function ReplyThread({
               onDelete={onDelete}
             />
           </div>
-            <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-100">{r.content}</p>
+            <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-100">
+              {renderCustomEmojis(r.content, parseFodprEmojiTags(r.tags))}
+            </p>
             {parentName && (
               <p className="mt-1 text-xs text-gray-500">
                 <ReplyIcon className="mr-1 inline h-3 w-3" />
@@ -3096,9 +4193,13 @@ function NostrNoteCard({
   onOpenUser,
   onReact,
   onRepost,
+  onQuote,
   onReply,
-  onDelete,
-}: {
+   onDelete,
+   noteById,
+   onOpenImage,
+  }: {
+
   e: NostrEvent;
   profileMap: Record<string, NostrEvent>;
   reactions: NostrEvent[] | undefined;
@@ -3108,9 +4209,20 @@ function NostrNoteCard({
   onOpenUser: (pubkeyHex: string) => void;
   onReact: (noteId: string, targetPubkey: string) => void;
   onRepost: (noteId: string, targetPubkey: string) => void;
+  onQuote: (noteId: string, targetPubkey: string) => void;
   onReply: (noteId: string, targetPubkey: string) => void;
   onDelete: (ev: NostrEvent) => void;
+  noteById?: Record<string, NostrEvent>;
+  onOpenImage?: (url: string) => void;
 }) {
+  const [repostMenuOpen, setRepostMenuOpen] = useState(false);
+  const repostBtnRef = useRef<HTMLButtonElement>(null);
+  const repostMenuPos = useMemo(() => {
+    const el = repostBtnRef.current;
+    if (!el) return { display: 'none' };
+    const r = el.getBoundingClientRect();
+    return { left: r.left, bottom: window.innerHeight - r.top + 6 };
+  }, [repostMenuOpen]);
   const name = nostrDisplayName(e.pubkey, profileMap);
   const meta = parseKind0Metadata(profileMap[e.pubkey]?.content ?? '');
   const agg = aggregateNostrReactions(reactions, selfPubkeyHex);
@@ -3119,6 +4231,14 @@ function NostrNoteCard({
   const selfReposted = (reposts ?? []).some((r) => r.pubkey === selfPubkeyHex);
   const repostCount = reposts?.length ?? 0;
   const isOwn = !!selfPubkeyHex && e.pubkey === selfPubkeyHex;
+  // 画像(imeta タグ / 本文 URL)は本文から取り除き、画像として表示する
+  const imgs = nostrImageUrls(e);
+  const inlineImgUrls = inlineImageUrls(e.content);
+  const imgUrlSet = new Set(imgs.map((i) => i.url));
+  let contentText = e.content;
+  for (const u of inlineImgUrls) {
+    if (imgUrlSet.has(u)) contentText = contentText.split(u).join('');
+  }
 
   return (
     <LiquidGlass intensity="subtle" refractive={false} className="liquid-glass--card w-full">
@@ -3153,7 +4273,23 @@ function NostrNoteCard({
               </button>
             )}
           </div>
-          <p className="mt-2 text-lg leading-relaxed whitespace-pre-wrap break-words sm:text-xl">{e.content}</p>
+          <p className="mt-2 text-lg leading-relaxed whitespace-pre-wrap break-words sm:text-xl">
+            {renderNostrContent(contentText, parseNostrEmojiTags(e.tags), noteById ?? null)}
+          </p>
+          {imgs.length > 0 && (
+            <div className="mt-2 space-y-2">
+              {imgs.map((img, i) => (
+                <img
+                  key={i}
+                  src={img.url}
+                  alt=""
+                  loading="lazy"
+                  onClick={onOpenImage ? () => onOpenImage(img.url) : undefined}
+                  className="max-h-96 w-auto max-w-full cursor-zoom-in rounded-xl"
+                />
+              ))}
+            </div>
+          )}
           <div className="mt-3 flex flex-wrap items-center gap-1.5">
             <button
               onClick={() => {
@@ -3187,23 +4323,61 @@ function NostrNoteCard({
             >
               <ReplyIcon className="h-4 w-4" />
             </button>
-            <button
-              onClick={() => {
-                if (loggedIn) onRepost(e.id, e.pubkey);
-              }}
-              disabled={!loggedIn}
-              title={selfReposted ? 'リポストを取り消す' : 'リポスト'}
-              className={
-                'flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors ' +
-                (selfReposted
-                  ? 'border-primary/60 bg-primary/15 text-primary'
-                  : 'border-white/15 text-gray-300 hover:bg-white/10') +
-                (!loggedIn ? ' opacity-40' : '')
-              }
-            >
-              <RepostIcon className="h-4 w-4" />
-              {repostCount > 0 && <span>{repostCount}</span>}
-            </button>
+            <div className="relative">
+              <button
+                ref={repostBtnRef}
+                onClick={() => {
+                  if (loggedIn) setRepostMenuOpen((o) => !o);
+                }}
+                disabled={!loggedIn}
+                title={selfReposted ? 'リポストを取り消す' : '共有(リポスト/引用)'}
+                aria-expanded={repostMenuOpen}
+                className={
+                  'flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors ' +
+                  (selfReposted
+                    ? 'border-primary/60 bg-primary/15 text-primary'
+                    : 'border-white/15 text-gray-300 hover:bg-white/10') +
+                  (!loggedIn ? ' opacity-40' : '')
+                }
+              >
+                <RepostIcon className="h-4 w-4" />
+                {repostCount > 0 && <span>{repostCount}</span>}
+              </button>
+              {repostMenuOpen &&
+                createPortal(
+                  <>
+                    <button
+                      className="fixed inset-0 z-40 cursor-default"
+                      aria-hidden="true"
+                      onClick={() => setRepostMenuOpen(false)}
+                    />
+                    <div
+                      className="fixed z-50 min-w-36 overflow-hidden rounded-xl border border-white/15 bg-[#14161a] shadow-xl"
+                      style={repostMenuPos}
+                    >
+                      <button
+                        onClick={() => {
+                          setRepostMenuOpen(false);
+                          if (selfReposted) onRepost(e.id, e.pubkey);
+                        }}
+                        className="block w-full px-3.5 py-2 text-left text-sm text-gray-200 transition-colors hover:bg-white/10"
+                      >
+                        {selfReposted ? 'リポストを取り消す' : 'リポスト'}
+                      </button>
+                      <button
+                        onClick={() => {
+                          setRepostMenuOpen(false);
+                          onQuote(e.id, e.pubkey);
+                        }}
+                        className="block w-full px-3.5 py-2 text-left text-sm text-gray-200 transition-colors hover:bg-white/10"
+                      >
+                        引用
+                      </button>
+                    </div>
+                  </>,
+                  document.body,
+                )}
+            </div>
           </div>
         </div>
       </div>
@@ -3223,10 +4397,13 @@ function NostrReplyThread({
   onOpenUser,
   onReact,
   onRepost,
-  onReply,
-  onDelete,
-  depth = 0,
-}: {
+  onQuote,
+   onReply,
+   onDelete,
+   noteById,
+   onOpenImage,
+   depth = 0,
+  }: {
   targetId: string;
   replies: Map<string, NostrEvent[]>;
   profileMap: Record<string, NostrEvent>;
@@ -3237,8 +4414,11 @@ function NostrReplyThread({
   onOpenUser: (pubkeyHex: string) => void;
   onReact: (noteId: string, targetPubkey: string) => void;
   onRepost: (noteId: string, targetPubkey: string) => void;
+  onQuote: (noteId: string, targetPubkey: string) => void;
   onReply: (noteId: string, targetPubkey: string) => void;
   onDelete: (ev: NostrEvent) => void;
+  noteById?: Record<string, NostrEvent>;
+  onOpenImage?: (url: string) => void;
   depth?: number;
 }) {
   if (depth > 4) return null;
@@ -3262,8 +4442,11 @@ function NostrReplyThread({
             onOpenUser={onOpenUser}
             onReact={onReact}
             onRepost={onRepost}
+            onQuote={onQuote}
             onReply={onReply}
             onDelete={onDelete}
+            noteById={noteById}
+            onOpenImage={onOpenImage}
           />
           <NostrReplyThread
             targetId={r.id}
@@ -3276,8 +4459,11 @@ function NostrReplyThread({
             onOpenUser={onOpenUser}
             onReact={onReact}
             onRepost={onRepost}
+            onQuote={onQuote}
             onReply={onReply}
             onDelete={onDelete}
+            noteById={noteById}
+            onOpenImage={onOpenImage}
             depth={depth + 1}
           />
         </div>
@@ -3302,10 +4488,15 @@ function NostrTimeline({
   onReact,
   onRepost,
   onReply,
+  onQuote,
   onDelete,
   onPost,
   replyTarget,
-  onCancelReply,
+  quoteTarget,
+   onCancelReply,
+   onCancelQuote,
+   noteById: noteByIdProp,
+   onOpenImage,
 }: {
   notes: NostrEvent[];
   replies: Map<string, NostrEvent[]>;
@@ -3319,12 +4510,27 @@ function NostrTimeline({
   onReact: (noteId: string, targetPubkey: string) => void;
   onRepost: (noteId: string, targetPubkey: string) => void;
   onReply: (noteId: string, targetPubkey: string) => void;
+  onQuote: (noteId: string, targetPubkey: string) => void;
   onDelete: (ev: NostrEvent) => void;
-  onPost: (text: string, replyTarget?: { id: string; pubkey: string } | null) => Promise<void>;
+  onPost: (
+    text: string,
+    replyTarget?: { id: string; pubkey: string } | null,
+    quoteTarget?: { id: string; pubkey: string } | null,
+  ) => Promise<void>;
   replyTarget: { id: string; pubkey: string } | null;
-  onCancelReply: () => void;
+  quoteTarget: { id: string; pubkey: string } | null;
+   onCancelReply: () => void;
+   onCancelQuote: () => void;
+   noteById: Record<string, NostrEvent>;
+   onOpenImage: (url: string) => void;
 }) {
   const [text, setText] = useState('');
+  const noteRef = useRef<HTMLTextAreaElement>(null);
+
+  // 返信/引用モードに入ったら入力欄へ自動フォーカスする(Fodpr コンポーザと同じ挙動)
+  useEffect(() => {
+    if (replyTarget || quoteTarget) noteRef.current?.focus();
+  }, [replyTarget, quoteTarget]);
 
   const noteIds = useMemo(() => new Set(notes.map((n) => n.id)), [notes]);
   // e タグが無いノート、または対象イベントが未取得のノートをトップレベル表示する
@@ -3341,13 +4547,18 @@ function NostrTimeline({
 
   const replyNote = replyTarget ? notes.find((n) => n.id === replyTarget.id) : undefined;
   const replyName = replyNote ? nostrDisplayName(replyNote.pubkey, profileMap) : undefined;
+  const quoteNote = quoteTarget ? notes.find((n) => n.id === quoteTarget.id) : undefined;
+  const quoteName = quoteNote ? nostrDisplayName(quoteNote.pubkey, profileMap) : undefined;
+
+  const noteById = noteByIdProp ?? Object.fromEntries(notes.map((n) => [n.id, n]));
 
   function submit() {
     const t = text.trim();
     if (!t || !loggedIn) return;
-    void onPost(t, replyTarget);
+    void onPost(t, replyTarget, quoteTarget);
     setText('');
     onCancelReply();
+    onCancelQuote();
   }
 
   return (
@@ -3363,18 +4574,34 @@ function NostrTimeline({
                 </button>
               </div>
             )}
+            {quoteTarget && quoteNote && (
+              <div className="mb-2 flex items-center justify-between rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-xs text-gray-400">
+                <span>引用: <span className="text-gray-200">{quoteName}</span></span>
+                <button onClick={onCancelQuote} className="text-gray-500 transition-colors hover:text-gray-300">
+                  解除
+                </button>
+              </div>
+            )}
             <textarea
+              ref={noteRef}
               value={text}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => {
                 if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') submit();
               }}
-              placeholder={replyTarget ? '返信を書く...' : 'Nostr に投稿する...'}
+              placeholder={replyTarget ? '返信を書く...' : quoteTarget ? '引用して投稿する...' : 'Nostr に投稿する...'}
               rows={3}
               className="w-full resize-none rounded-xl bg-black/30 px-3 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-white/25"
             />
             <div className="mt-2 flex items-center justify-between">
-              <p className="text-xs text-gray-500">{text.length} 文字</p>
+              <div className="flex items-center gap-2">
+                <EmojiPicker
+                  onPick={(def) => {
+                    if (noteRef.current) setText(insertTextAtCursor(noteRef.current, `:${def.shortcode}:`));
+                  }}
+                />
+                <p className="text-xs text-gray-500">{text.length} 文字</p>
+              </div>
               <button
                 onClick={submit}
                 disabled={!relayConnected || !text.trim()}
@@ -3406,23 +4633,29 @@ function NostrTimeline({
               onOpenUser={onOpenUser}
               onReact={onReact}
               onRepost={onRepost}
-              onReply={onReply}
-              onDelete={onDelete}
-            />
-            <NostrReplyThread
-              targetId={n.id}
-              replies={replies}
-              profileMap={profileMap}
-              reactions={reactions}
-              reposts={reposts}
-              selfPubkeyHex={selfPubkeyHex}
-              loggedIn={loggedIn}
-              onOpenUser={onOpenUser}
-              onReact={onReact}
-              onRepost={onRepost}
-              onReply={onReply}
-              onDelete={onDelete}
-            />
+               onQuote={onQuote}
+               onReply={onReply}
+               onDelete={onDelete}
+               noteById={noteById}
+               onOpenImage={onOpenImage}
+             />
+             <NostrReplyThread
+               targetId={n.id}
+               replies={replies}
+               profileMap={profileMap}
+               reactions={reactions}
+               reposts={reposts}
+               selfPubkeyHex={selfPubkeyHex}
+               loggedIn={loggedIn}
+               onOpenUser={onOpenUser}
+               onReact={onReact}
+               onRepost={onRepost}
+               onQuote={onQuote}
+               onReply={onReply}
+               onDelete={onDelete}
+               noteById={noteById}
+               onOpenImage={onOpenImage}
+             />
           </div>
         ))
       )}
@@ -3450,12 +4683,20 @@ function NostrUserModal({
   ownRelayUrls: string[];
   onAddRelay: (url: string) => void;
 }) {
-  const meta = parseKind0Metadata(profileMap[pubkey]?.content ?? '');
+  const profileEv = profileMap[pubkey];
+  const meta = parseKind0Metadata(profileEv?.content ?? '');
+  const profileEmojiMap = parseNostrEmojiTags(profileEv?.tags ?? []);
   const name = nostrDisplayName(pubkey, profileMap);
   const myNotes = useMemo(() => {
     const all = [...notes, ...[...replies.values()].flat()];
     return sortNostrDesc(all.filter((n) => n.pubkey === pubkey));
   }, [pubkey, notes, replies]);
+
+  // プロフィール画面でもノート参照のインラインプレビュー用
+  const userNoteById = useMemo(
+    () => Object.fromEntries(myNotes.map((n) => [n.id, n])),
+    [myNotes],
+  );
 
   // このユーザーの kind 10002(NIP-65)を一度だけ取得して表示する
   const [theirRelays, setTheirRelays] = useState<RelayList | null>(null);
@@ -3493,7 +4734,11 @@ function NostrUserModal({
             <p className="text-xs text-gray-500">{shortNpub(pubkey)}</p>
           </div>
         </div>
-        {meta.about && <p className="mt-3 whitespace-pre-wrap break-words text-sm text-gray-400">{meta.about}</p>}
+        {meta.about && (
+          <p className="mt-3 whitespace-pre-wrap break-words text-sm text-gray-400">
+            {renderCustomEmojis(meta.about, profileEmojiMap)}
+          </p>
+        )}
 
         {/* このユーザーの NIP-65 リレーリスト */
          !theirRelaysErr && (
@@ -3527,18 +4772,20 @@ function NostrUserModal({
         {theirRelaysErr && <p className="mt-2 text-xs text-red-400">{theirRelaysErr}</p>}
 
         <code className="mt-3 block break-all rounded-xl bg-black/30 px-3 py-2.5 text-xs text-gray-300">{pubkey}</code>
-        <div className="mt-4 space-y-2">
-          {myNotes.length === 0 ? (
-            <p className="pt-4 text-center text-sm text-gray-500">まだ投稿はありません</p>
-          ) : (
-            myNotes.map((n) => (
-              <div key={n.id} className="rounded-xl border border-white/10 bg-black/20 p-3">
-                <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-100">{n.content}</p>
-                <p className="mt-1 text-xs text-gray-500">{new Date(n.created_at * 1000).toLocaleString()}</p>
-              </div>
-            ))
-          )}
-        </div>
+         <div className="mt-4 space-y-2">
+           {myNotes.length === 0 ? (
+             <p className="text-center text-sm text-gray-500 pt-4">まだ投稿はありません</p>
+           ) : (
+             myNotes.map((n) => (
+               <div key={n.id} className="rounded-xl border border-white/10 bg-black/20 p-3">
+                 <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-100">
+                   {renderNostrContent(n.content, parseNostrEmojiTags(n.tags), userNoteById)}
+                 </p>
+                 <p className="mt-1 text-xs text-gray-500">{new Date(n.created_at * 1000).toLocaleString()}</p>
+               </div>
+             ))
+           )}
+         </div>
       </div>
     </>,
     document.body,
@@ -3556,6 +4803,8 @@ function NostrSettingsView({
   onLogout,
   secretHex,
   relayList,
+  theme,
+  onThemeChange,
 }: {
   relayUrls: string[];
   onRelayChange: (urls: string[]) => void;
@@ -3564,6 +4813,8 @@ function NostrSettingsView({
   onLogout: () => void;
   secretHex: string | null;
   relayList: RelayList | null;
+  theme: ThemeId;
+  onThemeChange: (t: ThemeId) => void;
 }) {
   const [relayInput, setRelayInput] = useState('');
   const [msg, setMsg] = useState<string | null>(null);
@@ -3621,6 +4872,28 @@ function NostrSettingsView({
       <LiquidGlass intensity="subtle" refractive className="liquid-glass--card w-full">
         <div className="space-y-4 p-5">
           <h2 className="text-lg font-semibold text-white">Nostr 設定</h2>
+
+          <div className="space-y-2">
+            <p className="text-xs text-gray-400">テーマ</p>
+            <div className="grid grid-cols-2 gap-2">
+              {THEME_OPTIONS.map((opt) => (
+                <button
+                  key={opt.id}
+                  onClick={() => onThemeChange(opt.id)}
+                  aria-pressed={theme === opt.id}
+                  className={
+                    'rounded-xl border px-3 py-2.5 text-left transition-colors ' +
+                    (theme === opt.id
+                      ? 'border-primary bg-primary/10 text-white'
+                      : 'border-white/15 bg-black/20 text-gray-300 hover:bg-white/10')
+                  }
+                >
+                  <span className="block text-sm font-semibold">{opt.label}</span>
+                  <span className="mt-0.5 block text-xs text-gray-400">{opt.desc}</span>
+                </button>
+              ))}
+            </div>
+          </div>
 
           <div className="space-y-2">
             <label className="block text-xs text-gray-400">Nostr リレー (複数登録可)</label>
@@ -3761,6 +5034,10 @@ function NostrProfileView({
   onSave: (name: string, about: string, picture: string) => Promise<void>;
 }) {
   const meta = useMemo(() => parseKind0Metadata(profileMap[pubkeyHex]?.content ?? ''), [profileMap, pubkeyHex]);
+  const profileEmojiMap = useMemo(
+    () => parseNostrEmojiTags(profileMap[pubkeyHex]?.tags ?? []),
+    [profileMap, pubkeyHex],
+  );
   const selfName = kind0DisplayName(meta) ?? shortNpub(pubkeyHex);
   const [name, setName] = useState(kind0DisplayName(meta) ?? '');
   const [about, setAbout] = useState(meta.about ?? '');
@@ -3853,7 +5130,11 @@ function NostrProfileView({
             {!editMode && (
               <>
                 <p className="truncate text-sm font-medium text-white">{kind0DisplayName(meta) || selfName}</p>
-                {meta.about && <p className="mt-0.5 whitespace-pre-wrap break-words text-sm text-gray-400">{meta.about}</p>}
+                {meta.about && (
+                  <p className="mt-0.5 whitespace-pre-wrap break-words text-sm text-gray-400">
+                    {renderCustomEmojis(meta.about, profileEmojiMap)}
+                  </p>
+                )}
               </>
             )}
             <p className="mt-1 break-all text-xs text-gray-500">{hexToNpub(pubkeyHex)}</p>
@@ -4325,7 +5606,13 @@ function SettingsView({
   relayConnected,
   onLogout,
   onShowDocs,
-  secretHex,
+   secretHex,
+  theme,
+  onThemeChange,
+  browserNotifEnabled,
+  notifPermission,
+  onToggleBrowserNotif,
+  onRequestNotifPermission,
 }: {
   relayUrls: string[];
   onRelayChange: (urls: string[]) => void;
@@ -4333,7 +5620,13 @@ function SettingsView({
   relayConnected: boolean;
   onLogout: () => void;
   onShowDocs: () => void;
-  secretHex: string | null;
+   secretHex: string | null;
+  theme: ThemeId;
+  onThemeChange: (t: ThemeId) => void;
+  browserNotifEnabled: boolean;
+  notifPermission: NotificationPermission;
+  onToggleBrowserNotif: (next: boolean) => void;
+  onRequestNotifPermission: () => void;
 }) {
   const [relayInput, setRelayInput] = useState('');
   const [msg, setMsg] = useState<string | null>(null);
@@ -4391,6 +5684,68 @@ function SettingsView({
       <LiquidGlass intensity="subtle" refractive className="liquid-glass--card w-full">
         <div className="space-y-4 p-5">
           <h2 className="text-lg font-semibold text-white">設定</h2>
+
+          <div className="space-y-2">
+            <p className="text-xs text-gray-400">テーマ</p>
+            <div className="grid grid-cols-2 gap-2">
+              {THEME_OPTIONS.map((opt) => (
+                <button
+                  key={opt.id}
+                  onClick={() => onThemeChange(opt.id)}
+                  aria-pressed={theme === opt.id}
+                  className={
+                    'rounded-xl border px-3 py-2.5 text-left transition-colors ' +
+                    (theme === opt.id
+                      ? 'border-primary bg-primary/10 text-white'
+                      : 'border-white/15 bg-black/20 text-gray-300 hover:bg-white/10')
+                  }
+                >
+                  <span className="block text-sm font-semibold">{opt.label}</span>
+                  <span className="mt-0.5 block text-xs text-gray-400">{opt.desc}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <label className="block text-xs text-gray-400">ブラウザ通知</label>
+            <div className="flex items-center justify-between rounded-xl border border-white/10 bg-black/20 px-3 py-2.5">
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium text-white">
+                  {notifPermission === 'granted' ? '通知を許可済み' : '通知未許可'}
+                </p>
+                <p className="mt-0.5 text-xs text-gray-500">
+                  新着返信・リアクションを OS 通知枠で受信します
+                </p>
+              </div>
+              {typeof Notification !== 'undefined' && notifPermission !== 'granted' ? (
+                <button
+                  onClick={onRequestNotifPermission}
+                  className="shrink-0 rounded-xl bg-primary px-4 py-2 text-sm font-semibold text-bg transition-colors hover:bg-primary-hover"
+                >
+                  許可する
+                </button>
+              ) : (
+                <button
+                  onClick={() => onToggleBrowserNotif(!browserNotifEnabled)}
+                  aria-pressed={browserNotifEnabled}
+                  className={
+                    'shrink-0 rounded-xl border px-4 py-2 text-sm font-semibold transition-colors ' +
+                    (browserNotifEnabled
+                      ? 'border-primary bg-primary/10 text-primary'
+                      : 'border-white/15 text-gray-300 hover:bg-white/10')
+                  }
+                >
+                  {browserNotifEnabled ? 'オン' : 'オフ'}
+                </button>
+              )}
+            </div>
+            {!!browserNotifEnabled && notifPermission !== 'granted' && (
+              <p className="text-xs text-red-400">
+                権限が許可されていません。ブラウザの通知設定を確認してください。
+              </p>
+            )}
+          </div>
 
           <div className="space-y-2">
             <label className="block text-xs text-gray-400">接続リレー (複数登録可)</label>
@@ -4499,10 +5854,166 @@ function SettingsView({
 }
 
 /* ────────────────────────────────────────────────────────────────────
+   背景テーマ。設定で選んだテーマに応じてオーロラ(グラデーション)または
+   ダークグラデ(IMG_2232.webp の配色をベース)を出す。写真は敷かない。
+   ──────────────────────────────────────────────────────────────────── */
+function ThemeBackground({ theme }: { theme: ThemeId }) {
+  return <div className={theme === 'modern' ? 'theme-modern' : 'aurora'} aria-hidden="true" />;
+}
+
+// カスタム絵文字ピッカー(NIP-30 の :shortcode: を挿入する)
+// 投稿欄の近くに配置し、クリックで絵文字グリッドを開く。
+function EmojiPicker({
+  onPick,
+  align = 'left',
+}: {
+  onPick: (def: CustomEmojiDef) => void;
+  align?: 'left' | 'right';
+}) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
+
+  // 外側クリックで閉じる
+  useEffect(() => {
+    if (!open) return;
+    function onClick(ev: MouseEvent) {
+      const t = ev.target as Node;
+      if (popRef.current?.contains(t) || btnRef.current?.contains(t)) return;
+      setOpen(false);
+    }
+    function onKeydown(ev: KeyboardEvent) {
+      if (ev.key === 'Escape') setOpen(false);
+    }
+    function closeOnScroll() {
+      setOpen(false);
+    }
+    document.addEventListener('mousedown', onClick);
+    document.addEventListener('keydown', onKeydown);
+    window.addEventListener('scroll', closeOnScroll, true);
+    window.addEventListener('resize', closeOnScroll);
+    return () => {
+      document.removeEventListener('mousedown', onClick);
+      document.removeEventListener('keydown', onKeydown);
+      window.removeEventListener('scroll', closeOnScroll, true);
+      window.removeEventListener('resize', closeOnScroll);
+    };
+  }, [open]);
+
+  // 画面内に収まるよう位置を補正(ポータル→body直下 fixed、overflow で隠れない)
+  useLayoutEffect(() => {
+    if (!open || !pos || !popRef.current) return;
+    const pr = popRef.current.getBoundingClientRect();
+    const W = 256; // w-64
+    const g = 8;
+    const left = Math.max(
+      g,
+      align === 'right'
+        ? window.innerWidth - W - g
+        : Math.min(pos.left, window.innerWidth - W - g),
+    );
+    let top = pos.top;
+    if (top + pr.height > window.innerHeight - g) {
+      const b = btnRef.current?.getBoundingClientRect();
+      if (b) top = b.top - pr.height - g;
+    }
+    top = Math.max(g, top);
+    setPos({ left, top });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  function toggle() {
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    const r = btnRef.current?.getBoundingClientRect();
+    if (!r) {
+      setOpen(true);
+      return;
+    }
+    setPos({ left: align === 'right' ? r.right - 256 : r.left, top: r.bottom + 6 });
+    setOpen(true);
+  }
+
+  return (
+    <div className="relative">
+      <button
+        ref={btnRef}
+        onClick={toggle}
+        title="カスタム絵文字"
+        aria-label="カスタム絵文字"
+        aria-expanded={open}
+        className="shrink-0 rounded-xl border border-white/15 px-2.5 py-2 text-gray-300 transition-colors hover:bg-white/10"
+      >
+        <svg
+          viewBox="0 0 24 24"
+          className="h-5 w-5"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <circle cx="12" cy="12" r="10" />
+          <path d="M8 14s1.5 2 4 2 4-2 4-2" />
+          <line x1="9" y1="9" x2="9.01" y2="9" />
+          <line x1="15" y1="9" x2="15.01" y2="9" />
+        </svg>
+      </button>
+      {open &&
+        createPortal(
+          <div
+            ref={popRef}
+            className="fixed z-50 w-64 rounded-2xl border border-white/10 bg-[#14161a]/95 p-2 shadow-2xl backdrop-blur"
+            style={pos ? { left: pos.left, top: pos.top } : undefined}
+          >
+            <div className="grid grid-cols-8 gap-1">
+              {CUSTOM_EMOJI.map((e) => (
+                <button
+                  key={e.shortcode}
+                  onClick={() => {
+                    onPick(e);
+                    setOpen(false);
+                  }}
+                  title={`:${e.shortcode}:`}
+                  className="flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-white/10"
+                >
+                  <img src={e.path} alt={e.shortcode} loading="lazy" className="h-6 w-6 object-contain" />
+                </button>
+              ))}
+            </div>
+            <p className="mt-1 border-t border-white/10 pt-1 text-center text-[10px] text-gray-500">
+              :shortcode: として挿入されます
+            </p>
+          </div>,
+          document.body,
+        )}
+    </div>
+  );
+}
+
+// テキストエリアのカーソル位置へ文字列を挿入し、次の状態を返す
+function insertTextAtCursor(textarea: HTMLTextAreaElement, text: string): string {
+  const start = textarea.selectionStart;
+  const end = textarea.selectionEnd;
+  const next = textarea.value.slice(0, start) + text + textarea.value.slice(end);
+  textarea.focus();
+  requestAnimationFrame(() => {
+    const pos = start + text.length;
+    textarea.setSelectionRange(pos, pos);
+  });
+  return next;
+}
+
+/* ────────────────────────────────────────────────────────────────────
    ログイン画面
    fsec(Fodpr)/nsec(Nostr) の入力欄を分けて設け、鍵なしの閲覧モードも選べる。
    ──────────────────────────────────────────────────────────────────── */
 function LoginScreen({
+  theme,
   onLogin,
   onGenerate,
   onNostrLogin,
@@ -4510,6 +6021,7 @@ function LoginScreen({
   onGuest,
   nostrLoggedIn,
 }: {
+  theme: ThemeId;
   onLogin: (input: string) => Promise<void>;
   onGenerate: () => Promise<void>;
   onNostrLogin: (input: string) => Promise<void>;
@@ -4561,13 +6073,13 @@ function LoginScreen({
 
   return (
     <div className="relative min-h-screen overflow-hidden bg-bg text-gray-100">
-      <div className="aurora" aria-hidden="true" />
+      <ThemeBackground theme={theme} />
 
       <div className="relative z-10 flex min-h-screen items-center justify-center px-4">
         <LiquidGlass intensity="vision" refractive className="w-full max-w-md">
           <div className="space-y-4 p-7">
             <div>
-              <h1 className="text-2xl font-semibold text-white">Fodpr</h1>
+              <h1 className="text-2xl font-semibold text-white">Prrr</h1>
               <p className="mt-1 text-sm text-gray-300">
                 Fodpr と Nostr の両方のタイムラインを利用できます。鍵なしで閲覧だけする場合は下の「閲覧だけする」。
               </p>

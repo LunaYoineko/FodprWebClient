@@ -80,10 +80,10 @@ cp public/docs.html /var/www/fodpr/docs.html
 ## Health / smoke checks
 
 ```sh
-curl -s -o /dev/null -w '%{http_code}\n' https://fodpr.yoinekodo.jp/
-curl -s -o /dev/null -w '%{http_code}\n' https://fodpr.yoinekodo.jp/docs.html
-curl -s -o /dev/null -w '%{http_code}\n' https://fodpr.yoinekodo.jp/api/docs
-curl -s https://fodpr.yoinekodo.jp/api/health
+curl -s -o /dev/null -w '%{http_code}\n' https://prrr.yoinekodo.jp/
+curl -s -o /dev/null -w '%{http_code}\n' https://prrr.yoinekodo.jp/docs.html
+curl -s -o /dev/null -w '%{http_code}\n' https://prrr.yoinekodo.jp/api/docs
+curl -s https://prrr.yoinekodo.jp/api/health
 ```
 
 ## Notes

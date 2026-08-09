@@ -97,3 +97,55 @@
     animation: none;
   }
 }
+
+/* ────────────────────────────────────────────────────────────────────
+   モダンテーマ(設定から選択可能)
+   写真そのものを敷くのではなく、IMG_2232.webp から抽出した配色
+   (深い夜空の紺・鋼青・鮮やかな青・ほのかなラベンダー)で作った
+   夕暮れ風のグラデーション背景。ガラスパネルがぼかして読める下地になる。
+   ──────────────────────────────────────────────────────────────────── */
+.theme-modern {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  background-color: #0d1116;
+  background-image:
+    radial-gradient(70rem 70rem at 18% -8%, rgb(76 154 240 / 0.24), transparent 62%),
+    radial-gradient(56rem 56rem at 108% 22%, rgb(187 115 174 / 0.14), transparent 60%),
+    radial-gradient(64rem 64rem at 50% 118%, rgb(52 73 97 / 0.55), transparent 68%);
+}
+
+.theme-modern::before,
+.theme-modern::after {
+  content: "";
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(90px);
+  animation: aurora-drift 30s ease-in-out infinite alternate;
+}
+
+.theme-modern::before {
+  width: 44rem;
+  height: 44rem;
+  left: -12rem;
+  top: -6rem;
+  background: radial-gradient(circle, rgb(76 154 240 / 0.5) 0%, transparent 65%);
+}
+
+.theme-modern::after {
+  width: 38rem;
+  height: 38rem;
+  right: -12rem;
+  bottom: -5rem;
+  background: radial-gradient(circle, rgb(187 115 174 / 0.45) 0%, transparent 65%);
+  animation-duration: 38s;
+  animation-delay: -14s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .theme-modern::before,
+  .theme-modern::after {
+    animation: none;
+  }
+}

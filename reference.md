@@ -1,7 +1,7 @@
-# FodprWebClient イベント送信リファレンス
+# Prrr イベント送信リファレンス
 
-この文書は、FodprWebClient (`/root/FodprWebClient`) がどのようなイベントをどの形式でリレーに送信しているかを説明し、
-別クライアントやスクリプトから同じ形式で投稿すれば FodprWebClient のタイムラインに表示されるための手順とコードを示す。
+この文書は、Prrr (`/root/FodprWebClient`) がどのようなイベントをどの形式でリレーに送信しているかを説明し、
+別クライアントやスクリプトから同じ形式で投稿すれば Prrr のタイムラインに表示されるための手順とコードを示す。
 
 対象プロトコルは FodprTSSDK (`/root/FodprTSSDK/src/protocol.ts`) の `Protocol` と `CryptoUtils` をそのまま使う。
 サーバー(Nim)の `protocol.nim` とバイト単位で互換。
@@ -21,7 +21,7 @@
 | `TransTypeString` | `0x02` | content が UTF-8 の文字列(テキスト投稿・リアクション・リポスト・リプライ) |
 | `TransTypeBinary` | `0x03` | content が任意のバイト列(画像/動画/ファイル投稿) |
 
-### 1.2 イベントの分類 (FodprWebClient 側)
+### 1.2 イベントの分類 (Prrr 側)
 
 クライアントは受信イベントを `splitEvents` (`src/App.tsx`) で以下のように振り分ける。
 
@@ -134,7 +134,7 @@ ws.send(Protocol.encodeReq(req)); // 先頭に 0x02 を含む
 - `picture` は直リンク URL。ファイルからアップロードした場合は `/media/file/<name>` の相対パスが入る
   (同一オリジン前提)。別オリジンのクライアントからも表示したい場合は絶対 URL を入れること。
 
-### 3.2 パース側 (FodprWebClient)
+### 3.2 パース側 (Prrr)
 
 ```ts
 // src/App.tsx
@@ -194,7 +194,7 @@ ws.send(frame.buffer);
 - `tags`: なし(リアクション/リポスト/引用/リプライでなければ)
 - 署名対象: `content` の UTF-8 バイト列
 
-### 4.2 送信コード (FodprWebClient の `postNote` 相当)
+### 4.2 送信コード (Prrr の `postNote` 相当)
 
 ```ts
 const content = '今日もにゃんこ日和。';
@@ -212,7 +212,7 @@ const event: FodprEvent = {
 sendEventToRelay(event); // Protocol.encodeEvent(event) に 0x01 前置して送信
 ```
 
-※ FodprWebClient 内部の `sendSignedEvent` は Optimistic 更新として自フィードにも即時反映するが、
+※ Prrr 内部の `sendSignedEvent` は Optimistic 更新として自フィードにも即時反映するが、
 外部クライアントから送る場合はサーバーからの PUSH で表示される。
 
 ---
@@ -244,7 +244,7 @@ sendEventToRelay(event); // Protocol.encodeEvent(event) に 0x01 前置して送
 | `filename:<文字列>` | 元ファイル名(プレビューやダウンロード名に使う) |
 | `mediatype:<image|video|file>` | 種別(動画かどうかの判定に使う) |
 
-### 5.3 送信コード (FodprWebClient の media 投稿部分相当)
+### 5.3 送信コード (Prrr の media 投稿部分相当)
 
 ```ts
 // mediaDataUrl の例: "data:image/png;base64,iVBORw0KGgo..."
@@ -272,7 +272,7 @@ const event: FodprEvent = {
 sendEventToRelay(event);
 ```
 
-### 5.4 圧縮 (FodprWebClient の挙動)
+### 5.4 圧縮 (Prrr の挙動)
 
 - 画像: 上限 12MB。`compressImageFile` で長辺 1600px までリサイズ+再エンコード
 - 動画: 上限 50MB。`compressVideoFile` で data URL 化、`extractVideoThumbnail` でサムネイル抽出
@@ -307,13 +307,37 @@ const sig3 = await CryptoUtils.signMessage(privKey, new TextEncoder().encode('�
 sendSignedEvent(TransTypeString, '返信本文', sig3, [`reply:${dedupeKeyOfTarget}`]);
 ```
 
-### 6.1 リプライの表示 (FodprWebClient 側)
+### 6.1 リプライの表示 (Prrr 側)
 
 - 分類: `splitEvents` で `reply:` タグを持つ TransTypeString を `replies` に振り分ける。
 - スレッド化: `replyMap` (`Map<dedupeKey, FodprEvent[]>`) で対象ごとに束ね、
   `TimelineCard`(トップレベルのみ)の直下に `ReplyThread` として表示する。返信の返信は再帰的に表示される(深さ上限 4)。
 - 返信カードは「◯◯ への返信」の宛先表示と、リアクション/返信/削除のアクションを持つ。
 - 自分のプロフィール画面では、自分の投稿一覧にリプライも含めて表示される。
+
+### 6.2 カスタム絵文字 (NIP-30 相当)
+
+本文内の `:shortcode:` をインライン画像に置き換える、Nostr の NIP-30 と同等の仕組み。
+
+- **記法**: `content` に `:shortcode:` を埋め込む。shortcode は英数字・ハイフン・アンダースコアのみ。
+- **タグ**: 使用している shortcode ごとに `emoji:<shortcode>:<url>` タグを付ける(絶対 URL)。
+  メディア投稿のキャプションにも同様に付与する。
+- **表示**: イベントの `emoji:` タグから shortcode → URL を解決し、`:shortcode:` を `<img>` に
+  置き換えて表示する。解決できない shortcode は原文のまま残す(NIP-30 のフォールバック規則)。
+- ビルトインパックの画像は `/emoji/*.svg`(Prrr がホスト)。投稿時は
+  `window.location.origin` を付けて絶対 URL にする。
+
+```ts
+// content: "よろしく :prrr: :fire:"
+const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(content));
+sendSignedEvent(TransTypeString, content, sig, [
+  `emoji:prrr:${origin}/emoji/prrr.svg`,
+  `emoji:fire:${origin}/emoji/fire.svg`,
+]);
+```
+
+Nostr 側では NIP-30 に従い、kind 1 イベントに `["emoji", shortcode, url]` タグを付けて
+同じ `:shortcode:` 記法でやり取りする。
 
 ---
 

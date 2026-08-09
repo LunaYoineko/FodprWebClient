@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>クライアント実装ガイド - Fodpr</title>
+<title>クライアント実装ガイド - Prrr</title>
 <style>
   :root {
     --bg: #0e1012;
@@ -112,6 +112,7 @@
     <a href="#profile">プロフィール</a>
     <a href="#react">リポスト・引用・リアクション</a>
     <a href="#reply">リプライ(スレッド)</a>
+    <a href="#emoji">カスタム絵文字</a>
     <a href="#dedupe">dedupeKey</a>
     <a href="#sign">署名</a>
     <a href="#rest">REST API</a>
@@ -253,6 +254,7 @@ sendEventToRelay(event);    // Protocol.encodeEvent + 0x01 前置 + バイナリ
       <tr><td><code>filename:&lt;文字列&gt;</code></td><td>元ファイル名(プレビューやダウンロード名)</td></tr>
       <tr><td><code>mediatype:&lt;image|video|file&gt;</code></td><td>種別(動画かどうかの判定)</td></tr>
     </table>
+    <p>メディア投稿のキャプションに <a href="#emoji">カスタム絵文字</a> を使う場合は <code>emoji:&lt;shortcode&gt;:&lt;url&gt;</code> タグも付与できます。</p>
 
     <h3>5.3 送信コード</h3>
     <pre><code>const dm = /^data:([^;]+);base64,(.+)$/s.exec(mediaDataUrl);
@@ -332,6 +334,24 @@ sendSignedEvent(TransTypeString, '返信本文', sig3, [`reply:${dedupeKeyOfTarg
 <div class="callout warn">リレーは過去に PUSH 済みのイベントを取り消しません。そのためクライアントは削除済みイベントの dedupeKey をローカルで記憶し、フィードから除外しています。</div>
 </section>
 
+  <!-- ── カスタム絵文字(NIP-30 相当) ── -->
+  <section id="emoji">
+    <h2><span class="n">7.5</span>カスタム絵文字 (NIP-30 相当)</h2>
+    <p>本文内の <code>:shortcode:</code> をインライン画像に置き換える、Nostr の <a href="https://github.com/nostr-protocol/nips/blob/master/30.md" target="_blank" rel="noopener">NIP-30</a> と同等の仕組みです。shortcode は英数字・ハイフン・アンダースコアのみ。</p>
+    <table>
+      <tr><th>ネットワーク</th><th>タグ形式</th></tr>
+      <tr><td>Fodpr</td><td><code>emoji:&lt;shortcode&gt;:&lt;url&gt;</code></td></tr>
+      <tr><td>Nostr</td><td><code>["emoji", "&lt;shortcode&gt;", "&lt;url&gt;"]</code></td></tr>
+    </table>
+<pre><code>// Fodpr テキスト投稿: content = "よろしく :prrr: :fire:"
+const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(content));
+sendSignedEvent(TransTypeString, content, sig, [
+  `emoji:prrr:${origin}/emoji/prrr.svg`,
+  `emoji:fire:${origin}/emoji/fire.svg`,
+]);</code></pre>
+    <p>表示時はイベントの <code>emoji:</code> / <code>["emoji", …]</code> タグから shortcode → URL を解決し、<code>:shortcode:</code> を <code>&lt;img&gt;</code> に置き換えます。解決できない shortcode は原文のまま残します(NIP-30 のフォールバック規則)。ビルトインパックの画像は <code>/emoji/*.svg</code>(Prrr がホスト、投稿時は <code>window.location.origin</code> 付きの絶対 URL)です。</p>
+</section>
+
   <!-- ── dedupeKey ── -->
   <section id="dedupe">
     <h2><span class="n">8.</span>dedupeKey(イベントの一意キー)</h2>
@@ -389,7 +409,7 @@ Content-Type: application/json
     <pre><code>localStorage.fodpr_relays = JSON.stringify(["wss://example.com/", "wss://fodpr.yoinekodo.jp/"]) // 複数可</code></pre>
   </section>
 
-  <footer>Fodpr クライアント実装ガイド · 本ドキュメントはサーバー上に静的に配信されています</footer>
+  <footer>Prrr クライアント実装ガイド · 本ドキュメントはサーバー上に静的に配信されています</footer>
 </div>
 </body>
 </html>

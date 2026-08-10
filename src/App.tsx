@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Protocol,
@@ -41,19 +41,30 @@ import {
   buildQuoteTags,
   type NostrEvent,
   type NostrTags,
+  type UnsignedNostrEvent,
 } from './lib/nostrProtocol';
+import {
+  type NosskeyCred,
+  loginNosskeyPasskey,
+  nosskeySupported,
+  registerNosskeyPasskey,
+} from './lib/nosskey';
 import { fetchNostrKind0, fetchNostrRelayList, type RelayList } from './lib/nostrRelay';
 import { useNostrRelay, type NostrRelayStatus } from './hooks/useNostrRelay';
 import {
-  CUSTOM_EMOJI,
+  allEmojis,
   buildFodprEmojiTags,
   buildNostrEmojiTags,
+  clearExternalEmojis,
+  parseEmoemoEvents,
   parseFodprEmojiTags,
   parseNostrEmojiTags,
+  registerExternalEmoji,
   renderCustomEmojis,
   renderNostrContent,
   type CustomEmojiDef,
 } from './lib/customEmoji';
+import { SteganographyText } from './lib/steganography';
 
 // 既定の接続先リレー(設定画面から追加・削除可能)
 const DEFAULT_RELAYS = [
@@ -71,18 +82,43 @@ const NOSTR_RELAYS_STORAGE_KEY = 'nostr_relays';
 // メモリ上のみなので、リロード後も nsec ログインを復元するために使う。
 const NOSTR_GUEST_STORAGE_KEY = 'fodpr_nostr_guest';
 
+// NIP-07 でログインした公開鍵(HEX)を保存するキー。
+// 秘密鍵はブラウザ拡張内に保持されるため、ここには公開鍵だけを残す。
+const NIP07_PUBKEY_STORAGE_KEY = 'fodpr_nip07_pubkey';
+
+// NIP-79 (Nosskey / PRF direct usage)でログインした際の credential ID + 公開鍵。
+// 秘密鍵はパスキーの PRF で毎回再生するため、ここには秘密鍵を永続化しない
+// (秘密鍵はメモリ上の nostrPrivKey にのみ保持され、リロード後は再照認で再生される)。
+// 再ログイン用の手がかり(credential ID + pubkey)だけを永続化する。
+const NOSSKEY_CRED_STORAGE_KEY = 'fodpr_nosskey_cred';
+
+// NIP-07: ブラウザ拡張が window.nostr に公開する API(秘密鍵は拡張内に保持)
+type Nip07Nostr = {
+  getPublicKey: () => Promise<string>;
+  signEvent: (ev: {
+    kind: number;
+    tags: string[][];
+    content: string;
+    created_at: number;
+  }) => Promise<{
+    id: string;
+    pubkey: string;
+    sig: string;
+    created_at: number;
+    kind: number;
+    tags: string[][];
+    content: string;
+  }>;
+};
+
+declare global {
+  interface Window {
+    nostr?: Nip07Nostr;
+  }
+}
+
 // ネットワーク(Fodpr / Nostr)のタブ識別子
 type ProtocolTab = 'fodpr' | 'nostr';
-
-// 背景テーマ。localStorage に保存し、設定画面から変更できる
-type ThemeId = 'aurora' | 'modern';
-const THEME_STORAGE_KEY = 'fodpr_theme';
-
-// 背景テーマの選択肢(設定画面用)
-const THEME_OPTIONS: { id: ThemeId; label: string; desc: string }[] = [
-  { id: 'aurora', label: 'オーロラ', desc: '淡いグラデーションの動く背景' },
-  { id: 'modern', label: 'ダークグラデ', desc: 'IMG_2232.webp の配色をベースにした夕暮れ風のグラデーション(写真は敷かない)' },
-];
 
 // ブラウザ通知のオン/オフ(localStorage 保存)
 const BROWSER_NOTIF_STORAGE_KEY = 'fodpr_browser_notifications';
@@ -101,6 +137,28 @@ function loadNotifiedIds(): Set<string> {
     /* ignore */
   }
   return new Set<string>();
+}
+
+// ミュート中 pubkey(Fodpr / Nostr 共通の HEX)を localStorage から復元する
+const MUTE_STORAGE_KEY = 'fodpr_muted_pubkeys';
+function loadMutedPubkeys(): Set<string> {
+  try {
+    const raw = localStorage.getItem(MUTE_STORAGE_KEY);
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) return new Set(arr.map((x) => String(x)));
+    }
+  } catch {
+    /* ignore */
+  }
+  return new Set<string>();
+}
+function saveMutedPubkeys(ids: Set<string>) {
+  try {
+    localStorage.setItem(MUTE_STORAGE_KEY, JSON.stringify(Array.from(ids)));
+  } catch {
+    /* ignore */
+  }
 }
 
 // 入力された秘密鍵文字列を HEX に正規化する(fsec1... 形式または 64桁HEX)
@@ -367,6 +425,143 @@ function captionFromTags(tags: string[]): string | null {
   return null;
 }
 
+// ── メンション ────────────────────────────────────────────────
+
+// メンション解決用のユーザー一覧(プロフィール名 + pubkey hex)
+type MentionUser = { pk: string; name: string };
+function mentionUsers(profileMap: Record<string, FodprEvent>): MentionUser[] {
+  return Object.keys(profileMap).map((pk) => ({
+    pk,
+    name: profileName(profileMap[pk]) ?? pk.slice(0, 12),
+  }));
+}
+
+// 名前・hex のどちらからも引ける lookup 辞書を構築する
+function buildMentionLookup(users: MentionUser[]): Map<string, MentionUser> {
+  const m = new Map<string, MentionUser>();
+  for (const u of users) {
+    m.set(u.pk, u);
+    m.set(u.name, u);
+  }
+  return m;
+}
+
+// content 内の `@名前` / `@hex` を名前解決して mention:<hex> タグへ変換する(重複排除)
+function buildFodprMentionTags(content: string, lookup: Map<string, MentionUser>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const re = /@([^\s@,。、!！?？;；]+)/g;
+  let mm: RegExpExecArray | null;
+  while ((mm = re.exec(content)) !== null) {
+    const u = lookup.get(mm[1]);
+    if (u && !seen.has(u.pk)) {
+      seen.add(u.pk);
+      out.push(`mention:${u.pk}`);
+    }
+  }
+  return out;
+}
+
+// Fodpr イベントの mention: タグからメンションされた pubkey 一覧を取り出す
+function mentionTagOf(e: FodprEvent): string[] {
+  return e.tags.filter((t) => t.startsWith('mention:')).map((t) => t.slice('mention:'.length));
+}
+
+// ── メンション(Nostr) ──────────────────────────────────────────
+
+// Nostr 用: 名前・hex・npub から pubkey を解決する lookup
+function buildNostrMentionLookup(profileMap: Record<string, NostrEvent>): Map<string, { pk: string; name: string }> {
+  const m = new Map<string, { pk: string; name: string }>();
+  for (const pk of Object.keys(profileMap)) {
+    const name = nostrDisplayName(pk, profileMap) ?? pk.slice(0, 12);
+    m.set(pk, { pk, name });
+    m.set(name, { pk, name });
+    try {
+      m.set(hexToNpub(pk), { pk, name });
+    } catch {
+      /* bech32 変換失敗は無視 */
+    }
+  }
+  return m;
+}
+
+// content 内の `@名前` / `@hex` / `@npub` を名前解決して NIP-10 の p タグへ変換する(重複排除)
+function buildNostrMentionPTags(content: string, lookup: Map<string, { pk: string; name: string }>): NostrTags {
+  const seen = new Set<string>();
+  const out: NostrTags = [];
+  const re = /@([^\s@,。、!！?？;；]+)/g;
+  let mm: RegExpExecArray | null;
+  while ((mm = re.exec(content)) !== null) {
+    const u = lookup.get(mm[1]);
+    if (u && !seen.has(u.pk)) {
+      seen.add(u.pk);
+      out.push(['p', u.pk]);
+    }
+  }
+  return out;
+}
+
+// Fodpr 本文の :shortcode:(絵文字)と @名前/@hex(メンション)を描画する。
+// メンションは名前解決できる場合に限りプロフィールを開くボタンにする。
+function renderFodprContent(
+  content: string,
+  emojiMap: Record<string, string>,
+  mentionLookup: Map<string, MentionUser>,
+  onOpenUser: (pubkeyHex: string) => void,
+): ReactNode[] {
+  const TOKEN_RE = /(:[A-Za-z0-9_-]+:)|(@[^\s@,。、!！?？;；]+)/g;
+  const parts: string[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = TOKEN_RE.exec(content)) !== null) {
+    if (m.index > last) parts.push(content.slice(last, m.index));
+    parts.push(m[0]);
+    last = m.index + m[0].length;
+  }
+  if (last < content.length) parts.push(content.slice(last));
+
+  const out: ReactNode[] = [];
+  for (const part of parts) {
+    if (!part) continue;
+    const emoji = /^:([A-Za-z0-9_-]+):$/.exec(part);
+    if (emoji) {
+      const url = emojiMap[emoji[1]];
+      if (url) {
+        out.push(
+          <img
+            key={`e${out.length}`}
+            src={url}
+            alt={emoji[1]}
+            title={emoji[1]}
+            loading="lazy"
+            className="inline-block h-[1.35em] w-[1.35em] max-w-[1.35em] align-[-0.25em] rounded-[0.2em] object-contain"
+          />,
+        );
+        continue;
+      }
+    }
+    const mention = /^@(.+)$/.exec(part);
+    if (mention) {
+      const u = mentionLookup.get(mention[1]);
+      if (u) {
+        out.push(
+          <button
+            key={`m${out.length}`}
+            onClick={() => onOpenUser(u.pk)}
+            className="text-primary transition-colors hover:text-primary-hover hover:underline"
+            title="プロフィールを開く"
+          >
+            @{u.name}
+          </button>,
+        );
+        continue;
+      }
+    }
+    out.push(<SteganographyText key={`t${out.length}`} content={part} />);
+  }
+  return out;
+}
+
 // リアクションイベントのタグ(react:<対象の dedupeKey>)から対象イベントのキーを取り出す
 function reactionTarget(e: FodprEvent): string | null {
   for (const t of e.tags) {
@@ -435,7 +630,7 @@ function aggregateReactions(list: ReactionItem[] | undefined, selfPubkeyHex: str
   return [...m.entries()].map(([emoji, v]) => ({ emoji, ...v }));
 }
 
-type ReactionItem = { emoji: string; pubkey: string };
+type ReactionItem = { emoji: string; pubkey: string; createdAt: number };
 type ReactionMap = Map<string, ReactionItem[]>;
 
 // 対象イベントの dedupeKey をキーに、そのイベントへのリプライを束ねる
@@ -525,7 +720,7 @@ function PenIcon({ className }: { className?: string }) {
 
 // 通知の種類と発生元
 type NotificationSource = 'fodpr' | 'nostr';
-type NotificationType = 'react' | 'reply' | 'repost' | 'quote';
+type NotificationType = 'react' | 'reply' | 'repost' | 'quote' | 'mention';
 
 // 通知1件: 誰が・どの投稿に・いつアクションしたか
 type Notification = {
@@ -585,6 +780,7 @@ function NotificationsView({
   nostrReactions,
   nostrReposts,
   noteById,
+  mentionLookup,
 }: {
   notifications: Notification[];
   readNotifIds: Set<string>;
@@ -617,8 +813,10 @@ function NotificationsView({
   nostrReplyMap?: Map<string, NostrEvent[]>;
   links?: FodprEvent[];
   nostrRepostMap?: Map<string, NostrEvent[]>;
+  mentionLookup: Map<string, MentionUser>;
 }) {
   const sorted = sortByCreatedAt(notifications);
+  const nostrMentionLookup = useMemo(() => buildNostrMentionLookup(nostrProfileMap), [nostrProfileMap]);
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between px-1">
@@ -650,7 +848,8 @@ function NotificationsView({
             const typeLabel =
               n.type === 'react' ? 'リアクション' :
               n.type === 'reply' ? '返信' :
-              n.type === 'repost' ? 'リポスト' : '引用';
+              n.type === 'repost' ? 'リポスト' :
+              n.type === 'mention' ? 'あなたをメンション' : '引用';
 
             // インタラクション元のイベントを取得（返信/引用/リポスト/リアクション）
             let interactionEvent: FodprEvent | NostrEvent | null = null;
@@ -700,10 +899,16 @@ function NotificationsView({
 
             return (
               <div key={n.id} className="space-y-2">
-                {/* 通知ヘッダー */}
-                <div className={`rounded-xl border px-3 py-2 text-sm ${
-                  unread ? 'border-primary/40 bg-primary/5' : 'border-white/10 bg-black/20'
-                }`}>
+                {/* 通知ヘッダー(タップで既読にして対象投稿を開く) */}
+                <button
+                  onClick={() => {
+                    onMarkRead(n.id);
+                    onOpenPost(n);
+                  }}
+                  className={`block w-full rounded-xl border px-3 py-2 text-left text-sm transition-colors ${
+                    unread ? 'border-primary/40 bg-primary/5 hover:bg-primary/10' : 'border-white/10 bg-black/20 hover:bg-white/5'
+                  }`}
+                >
                   <div className="flex items-center gap-2">
                     <span className={'h-2 w-2 shrink-0 rounded-full ' + (unread ? 'bg-primary' : 'bg-transparent')} />
                     <span className="font-medium text-white">{senderName}</span>
@@ -712,16 +917,10 @@ function NotificationsView({
                     <span className="text-gray-400"> しました</span>
                     <span className="ml-auto text-xs text-gray-500">{relativeTime(n.createdAt)}</span>
                   </div>
-                  <button
-                    onClick={() => {
-                      onMarkRead(n.id);
-                      onOpenPost(n);
-                    }}
-                    className="mt-1 text-xs text-primary hover:underline"
-                  >
-                    既読にする
-                  </button>
-                </div>
+                  <span className="mt-1 block text-xs text-gray-500 hover:underline">
+                    {unread ? 'タップして既読にして開く' : 'タップして開く'}
+                  </span>
+                </button>
                 {/* 対象投稿＋インタラクションをスレッド風に表示 */}
                 {n.source === 'fodpr' ? (
                   <>
@@ -740,6 +939,7 @@ function NotificationsView({
                       onQuote={onQuote}
                       onReply={onReply}
                       onDelete={onDelete}
+                      mentionLookup={mentionLookup}
                     />
                     {interactionEvent && (
                       <div className="ml-3 mt-2 border-l-2 border-primary/30 pl-3 space-y-2">
@@ -763,6 +963,7 @@ function NotificationsView({
                           onReply={onReply}
                           onDelete={onDelete}
                           embedded={true}
+                          mentionLookup={mentionLookup}
                         />
                       </div>
                     )}
@@ -783,6 +984,7 @@ function NotificationsView({
                       onReply={onReply}
                       onDelete={onDelete}
                       noteById={noteById}
+                      mentionLookup={nostrMentionLookup}
                     />
                     {interactionEvent && (
                       <div className="ml-3 mt-2 border-l-2 border-primary/30 pl-3 space-y-2">
@@ -804,6 +1006,7 @@ function NotificationsView({
                           onReply={onReply}
                           onDelete={onDelete}
                           noteById={noteById}
+                          mentionLookup={nostrMentionLookup}
                         />
                       </div>
                     )}
@@ -1097,10 +1300,33 @@ function App() {
 
   // Nostr 秘密鍵(nsec)は Fodpr の fsec とは別に保持する
   const [nostrPrivKey, setNostrPrivKey] = useState<string | null>(null);
-  const nostrPubkeyHex = useMemo(
-    () => (nostrPrivKey ? getPublicKeyFromSecret(nostrPrivKey) : ''),
-    [nostrPrivKey],
-  );
+  // NIP-07: ブラウザ拡張ログイン時の公開鍵(秘密鍵は拡張内に保持され、ここには持たない)
+  const [nostrNip07Pubkey, setNostrNip07Pubkey] = useState<string | null>(null);
+  // NIP-79 (Nosskey): パスキーの credential ID + 公開鍵。秘密鍵は PRF で再生するので
+  // ここには秘密鍵を持たない(再ログインの手がかかりとして credential ID 惰利する)。
+   const [nostrPasskeyCred, setNostrPasskeyCred] = useState<NosskeyCred | null>(null);
+   const nostrPubkeyHex = useMemo(
+     () =>
+       nostrPrivKey
+         ? getPublicKeyFromSecret(nostrPrivKey)
+         : nostrNip07Pubkey ?? '',
+     [nostrPrivKey, nostrNip07Pubkey],
+   );
+
+   // ログイン方法(nsec / NIP-07 / パスキー)を判定。パスキーでログイン中は nostrPrivKey が
+   // メモリにないと分からない(nsec と同じ値を持つ)ため、nostrPasskeyCred がセットされて
+   // いるかで区別する。
+   const nostrLoginMethod: 'nsec' | 'nip07' | 'passkey' | null = useMemo(
+     () =>
+       nostrPrivKey
+         ? nostrPasskeyCred
+           ? 'passkey'
+           : 'nsec'
+         : nostrNip07Pubkey
+           ? 'nip07'
+           : null,
+     [nostrPrivKey, nostrNip07Pubkey, nostrPasskeyCred],
+   );
 
   // TL 上の Nostr ユーザー名をクリックしたときに開く「他ユーザーのプロフィール」
   const [nostrOpenPubkey, setNostrOpenPubkey] = useState<string | null>(null);
@@ -1117,19 +1343,6 @@ function App() {
   // 通知から対象投稿をオーバーレイ表示用
   const [notifPost, setNotifPost] = useState<{ post: FodprEvent | NostrEvent; source: 'fodpr' | 'nostr' } | null>(null);
   const isSm = useIsSm();
-
-  // 背景テーマ(localStorage 永続化)。設定画面で切り替える
-  // 背景テーマ(localStorage 永続化)。設定画面で切り替える
-  // 'photo' は旧キー名(→ 'modern')としても読み込み互換する
-  const [theme, setTheme] = useState<ThemeId>(() => {
-    const saved = localStorage.getItem(THEME_STORAGE_KEY);
-    return saved === 'modern' || saved === 'photo' ? 'modern' : 'aurora';
-  });
-
-  function changeTheme(next: ThemeId) {
-    setTheme(next);
-    localStorage.setItem(THEME_STORAGE_KEY, next);
-  }
 
   // クライアント実装ドキュメントページを新しいタブで開く
   function openDocs() {
@@ -1162,13 +1375,13 @@ function App() {
   const [nostrRelayList, setNostrRelayList] = useState<RelayList | null>(null);
   const nostrRelayUrlsKey = nostrRelayUrls.join('\n');
 
-  // nsec ログイン中は kind 10002 を取得して読み書きリレーを把握する
+  // ログイン中(nsec または NIP-07)は kind 10002 を取得して読み書きリレーを把握する
   useEffect(() => {
-    if (!nostrPrivKey) {
+    if (!nostrPubkeyHex) {
       setNostrRelayList(null);
       return;
     }
-    const pk = getPublicKeyFromSecret(nostrPrivKey);
+    const pk = nostrPubkeyHex;
     const urls = nostrRelayUrls.length ? nostrRelayUrls : DEFAULT_NOSTR_RELAYS;
     let cancelled = false;
     fetchNostrRelayList(urls, pk)
@@ -1182,7 +1395,7 @@ function App() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nostrPrivKey, nostrRelayUrlsKey]);
+  }, [nostrPubkeyHex, nostrRelayUrlsKey]);
 
   // 自クライアントの Nostr 投稿を即座にフィードへ反映するためのローカル蓄積(Optimistic)
   const [nostrLocalEvents, setNostrLocalEvents] = useState<NostrEvent[]>([]);
@@ -1268,6 +1481,22 @@ function App() {
    // ページリロード後も再通知しないよう localStorage へ永続化する。
    const notifiedIdsRef = useRef<Set<string>>(loadNotifiedIds());
 
+   // ブラウザ通知の基準時刻。ページを開いた瞬間以降に作成された通知だけを
+   // OS 通知として飛ばし、起動時一括取得で届く過去の通知は飛ばさない。
+   const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
+
+   // ミュート中の pubkey(Fodpr / Nostr 共通、localStorage 永続化)
+   const [mutedPubkeys, setMutedPubkeys] = useState<Set<string>>(loadMutedPubkeys);
+   function toggleMute(pubkeyHex: string) {
+     setMutedPubkeys((prev) => {
+       const next = new Set(prev);
+       if (next.has(pubkeyHex)) next.delete(pubkeyHex);
+       else next.add(pubkeyHex);
+       saveMutedPubkeys(next);
+       return next;
+     });
+   }
+
    // 設定でオンにしたタイミングで権限をリクエストする
    function setBrowserNotifsEnabled(next: boolean) {
      setBrowserNotifEnabled(next);
@@ -1352,6 +1581,36 @@ function App() {
           setNostrPrivKey(null);
         }
       }
+
+       // NIP-07 でログインしていた場合、公開鍵だけを復元する(鍵は拡張内に保持されている)
+      if (!nhex) {
+        try {
+          const nip07 = localStorage.getItem(NIP07_PUBKEY_STORAGE_KEY);
+          if (nip07 && /^[0-9a-f]{64}$/i.test(nip07)) {
+            setNostrNip07Pubkey(nip07);
+            if (!hex && localStorage.getItem(NOSTR_GUEST_STORAGE_KEY) === '1') {
+              setGuestMode(true);
+              setActiveTab('nostr');
+            }
+          }
+        } catch {
+          /* 無視 */
+        }
+      }
+
+      // NIP-79 (Nosskey) パスキーが登録済みなら credential ID + 公開鍵を復元する。
+      // 秘密鍵は復元できない(ログイン画面で再照認)ため、ここでは credential 情報だけ保持する。
+      try {
+        const cred = localStorage.getItem(NOSSKEY_CRED_STORAGE_KEY);
+        if (cred) {
+          const parsed = JSON.parse(cred) as NosskeyCred;
+          if (parsed.credId && /^[0-9a-f]{64}$/i.test(parsed.pubkey)) {
+            setNostrPasskeyCred(parsed);
+          }
+        }
+      } catch {
+        /* 無視 */
+      }
       setReady(true);
     })();
     return () => {
@@ -1425,7 +1684,7 @@ function App() {
       const key = reactionTarget(e);
       if (!key || !e.content.trim()) continue;
       const list = m.get(key) ?? [];
-      list.push({ emoji: e.content, pubkey: CryptoUtils.bytesToHex(e.pubkey) });
+      list.push({ emoji: e.content, pubkey: CryptoUtils.bytesToHex(e.pubkey), createdAt: e.createdAt });
       m.set(key, list);
     }
     return m;
@@ -1467,6 +1726,9 @@ function App() {
     }
     return s;
   }, [links, pubkeyHex]);
+
+  // Fodpr の @メンションを @名前/@hex から pubkey へ解決する lookup
+  const mentionLookup = useMemo(() => buildMentionLookup(mentionUsers(profileMap)), [profileMap]);
 
   // ────────────────────────────────────────────────────────────────────────
   // Nostr タブのイベント導出
@@ -1524,6 +1786,9 @@ function App() {
     () => nostrAllEvents.filter((e) => e.kind === 1 && !nostrDeletedIds.has(e.id)),
     [nostrAllEvents, nostrDeletedIds],
   );
+
+  // Nostr の @メンションを @名前/@hex/@npub から pubkey へ解決する lookup
+  const nostrMentionLookup = useMemo(() => buildNostrMentionLookup(nostrProfileMap), [nostrProfileMap]);
 
   // インラインノート参照(nostr:note1...)のプレビュー用: id → イベントの引きテーブル
   const nostrNoteById = useMemo(
@@ -1621,7 +1886,7 @@ function App() {
           type: 'react',
           senderPubkey: r.pubkey,
           targetKey,
-          createdAt: 0,
+          createdAt: r.createdAt,
         });
       }
     }
@@ -1654,6 +1919,23 @@ function App() {
         type: isQuote ? 'quote' : 'repost',
         senderPubkey: pk,
         targetKey: t,
+        createdAt: e.createdAt,
+      });
+    }
+    // Fodpr: メンション(mention:<自分のpubkey> タグ付きの投稿)
+    for (const e of allEvents) {
+      const pk = CryptoUtils.bytesToHex(e.pubkey);
+      if (pk === pubkeyHex) continue;
+      if (e.transType === TransTypeJSON) continue;
+      if (!mentionTagOf(e).includes(pubkeyHex)) continue;
+      const key = dedupeKey(e);
+      if (myFodprKeys.has(key)) continue;
+      out.push({
+        id: `f:mention:${key}:${pubkeyHex}`,
+        source: 'fodpr',
+        type: 'mention',
+        senderPubkey: pk,
+        targetKey: key,
         createdAt: e.createdAt,
       });
     }
@@ -1703,11 +1985,31 @@ function App() {
         });
       }
     }
-    return sortByCreatedAt(out);
+    // Nostr: メンション(kind 1 の p タグに自分が含まれる投稿)
+    if (nostrPubkeyHex) {
+      for (const e of nostrAllEvents) {
+        if (e.kind !== 1 || nostrDeletedIds.has(e.id)) continue;
+        if (e.pubkey === nostrPubkeyHex) continue;
+        const hasP = e.tags.some((t) => t[0] === 'p' && t[1] === nostrPubkeyHex);
+        if (!hasP) continue;
+        if (myNostrNoteIds.has(e.id)) continue;
+        out.push({
+          id: `n:mention:${e.id}:${nostrPubkeyHex}`,
+          source: 'nostr',
+          type: 'mention',
+          senderPubkey: e.pubkey,
+          targetKey: e.id,
+          createdAt: e.created_at,
+        });
+      }
+    }
+    // ミュート中のユーザーからの通知は表示しない
+    return sortByCreatedAt(out.filter((n) => !mutedPubkeys.has(n.senderPubkey)));
   }, [
     reactionMap,
     replyMap,
     links,
+    allEvents,
     myFodprKeys,
     myNostrNoteIds,
     nostrReactionMap,
@@ -1715,6 +2017,7 @@ function App() {
     nostrRepostMap,
     pubkeyHex,
     nostrPubkeyHex,
+    mutedPubkeys,
   ]);
 
   // Fodpr 側 / Nostr 側それぞれの通知。各ネットワークのタブでは自分の側の通知だけを表示する
@@ -1728,12 +2031,19 @@ function App() {
   );
   const activeNotifications = activeTab === 'fodpr' ? fodprNotifications : nostrNotifications;
 
+  // 各ネットワークの未読通知数(ナビの「通知」にバッジ表示する)
+  const unreadCountByTab = {
+    fodpr: fodprNotifications.filter((n) => !readNotifIds.has(n.id)).length,
+    nostr: nostrNotifications.filter((n) => !readNotifIds.has(n.id)).length,
+  };
+
   // 通知種別の日本語ラベル
   const typeLabels: Record<NotificationType, string> = {
     react: 'リアクション',
     reply: '返信',
     repost: 'リポスト',
     quote: '引用',
+    mention: 'メンション',
   };
 
   // 新着未読通知が来たらブラウザ通知を飛ばす(タブが背面のとき重点的に)
@@ -1744,6 +2054,11 @@ function App() {
     let changed = false;
     for (const n of notifications) {
       if (seen.has(n.id)) continue;
+      // 一度飛ばした/既読でも id は記憶して再通知しない
+      seen.add(n.id);
+      changed = true;
+      // 起動時など一括取得で届いた過去の通知(ページを開く前に作成されたもの)は飛ばさない
+      if (n.createdAt > 0 && n.createdAt < notifWatermarkRef.current) continue;
       // 未読かつ最前面で通知タブを開いていない場合のみ飛ばす
       let shouldFire = false;
       if (!readNotifIds.has(n.id)) {
@@ -1751,9 +2066,6 @@ function App() {
           view === 'notifications' && activeTab === (n.source === 'fodpr' ? 'fodpr' : 'nostr');
         shouldFire = document.hidden || !onNotifView;
       }
-      // 一度飛ばした/既読でも id は記憶して再通知しない
-      seen.add(n.id);
-      changed = true;
       if (!shouldFire) continue;
       const name =
         n.source === 'fodpr'
@@ -1934,27 +2246,88 @@ function App() {
 
   // Nostr リレー接続後に kind 0/1/5/6/7 を購読する。
   // NIP-65 の read マーカーがあれば read リレーだけから読み込む。
+  // 初回は直近ウィンドウを小さく取得して UI を早く立ち上げ、その後に過去分を
+  // 時間ウィンドウごとに分割して段階取得する。1 回の REQ で大量イベント
+  // (limit 10000 相当)が一気に届くのを避けるため、ウィンドウごとに少し間隔を開ける。
   useEffect(() => {
     if (!nostrRelay.connected) return;
-const t = setTimeout(() => {
-        // limit を大きくして過去のイベントも含めて取得（通知用）
-        const filters = [{ kinds: [0, 1, 5, 6, 7], limit: 10000 }];
+    const readTargets =
+      nostrRelayList && (nostrRelayList.read.length > 0 || nostrRelayList.both.length > 0)
+        ? [...nostrRelayList.read, ...nostrRelayList.both]
+        : null;
+    const send = (subId: string, filters: Record<string, unknown>[]) => {
+      try {
+        if (readTargets) {
+          nostrRelay.sendReqTo(readTargets, subId, filters);
+        } else {
+          nostrRelay.sendReq(subId, filters);
+        }
+      } catch {
+        /* 未接続中は無視 */
+      }
+    };
+    const now = Math.floor(Date.now() / 1000);
+    const DAY = 86400;
+    // [since, until] の時間ウィンドウ。先頭ほど優先(直近ほど先に取得する)
+    const windows: { since: number; until: number | null; limit: number }[] = [
+      { since: now - 7 * DAY, until: null, limit: 800 },
+      { since: now - 30 * DAY, until: now - 7 * DAY, limit: 1000 },
+      { since: now - 180 * DAY, until: now - 30 * DAY, limit: 1500 },
+      { since: 0, until: now - 180 * DAY, limit: 2000 },
+    ];
+    const base = 'nostr_main_' + Date.now();
+    const timers: number[] = [];
+    windows.forEach((w, i) => {
+      timers.push(
+        window.setTimeout(() => {
+          const filters: Record<string, unknown>[] = [{ kinds: [0, 1, 5, 6, 7] }];
+          if (w.since > 0) filters[0].since = w.since;
+          if (w.until) filters[0].until = w.until;
+          filters[0].limit = w.limit;
+          send(base + '_' + i, filters);
+        }, 300 + i * 900),
+      );
+    });
+    return () => {
+      for (const t of timers) clearTimeout(t);
+    };
+  }, [nostrRelay.connected, nostrRelay.sendReq, nostrRelay.sendReqTo, nostrRelayList]);
+
+  // emoemo(koteitan さんの NIP-30 絵文字マネージャ)対応:
+  // kind 30030(絵文字パック)と、ログイン中なら自分の kind 10030(マイ絵文字リスト)を取得する。
+  useEffect(() => {
+    if (!nostrRelay.connected) return;
+    const t = setTimeout(() => {
+      const filters: Record<string, unknown>[] = [{ kinds: [30030], limit: 200 }];
+      if (nostrPubkeyHex) filters.push({ kinds: [10030], authors: [nostrPubkeyHex] });
       const readTargets =
         nostrRelayList && (nostrRelayList.read.length > 0 || nostrRelayList.both.length > 0)
           ? [...nostrRelayList.read, ...nostrRelayList.both]
           : null;
       try {
         if (readTargets) {
-          nostrRelay.sendReqTo(readTargets, 'nostr_main_' + Date.now(), filters);
+          nostrRelay.sendReqTo(readTargets, 'nostr_emoemo_' + Date.now(), filters);
         } else {
-          nostrRelay.sendReq('nostr_main_' + Date.now(), filters);
+          nostrRelay.sendReq('nostr_emoemo_' + Date.now(), filters);
         }
       } catch {
         /* 未接続中は無視 */
       }
-    }, 300);
+    }, 400);
     return () => clearTimeout(t);
-  }, [nostrRelay.connected, nostrRelay.sendReq, nostrRelay.sendReqTo, nostrRelayList]);
+  }, [nostrRelay.connected, nostrRelay.sendReq, nostrRelay.sendReqTo, nostrRelayList, nostrPubkeyHex]);
+
+  // emoemo から取得した絵文字をレジストリへ登録し、ピッカー表示用 state にも反映する
+  const [externalEmojis, setExternalEmojis] = useState<CustomEmojiDef[]>([]);
+  useEffect(() => {
+    const defs = parseEmoemoEvents(nostrAllEvents);
+    clearExternalEmojis();
+    for (const d of defs) registerExternalEmoji(d);
+    setExternalEmojis(defs);
+  }, [nostrAllEvents]);
+
+  // ピッカー用一覧(ビルトイン + emoemo)。externalEmojis の更新時に作り直す
+  const pickerEmojis = useMemo(() => allEmojis(), [externalEmojis]);
 
   // タイムラインに登場した pubkey の kind 0(プロフィール)を未取得分だけ取得する。
   // メイン購読の limit で kind 0 が取り切れないことがあるため、authors 指定で補完する。
@@ -2166,6 +2539,7 @@ const t = setTimeout(() => {
       const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(content));
       sendSignedEvent(TransTypeString, content, sig, [
         `quote:${quoteTarget}`,
+        ...buildFodprMentionTags(content, mentionLookup),
         ...buildFodprEmojiTags(content),
       ]);
       setNoteText('');
@@ -2182,6 +2556,7 @@ const t = setTimeout(() => {
       const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(content));
       sendSignedEvent(TransTypeString, content, sig, [
         `reply:${replyTarget}`,
+        ...buildFodprMentionTags(content, mentionLookup),
         ...buildFodprEmojiTags(content),
       ]);
       setNoteText('');
@@ -2213,6 +2588,7 @@ const t = setTimeout(() => {
         `caption:${caption}`,
         `filename:${mediaName}`,
         `mediatype:${mediaType}`,
+        ...buildFodprMentionTags(caption, mentionLookup),
         ...buildFodprEmojiTags(caption),
       ];
       sendSignedEvent(TransTypeBinary, mediaContent, sig, tags);
@@ -2233,7 +2609,10 @@ const t = setTimeout(() => {
 
     if (!content) return;
     const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(content));
-    sendSignedEvent(TransTypeString, content, sig, buildFodprEmojiTags(content));
+    sendSignedEvent(TransTypeString, content, sig, [
+      ...buildFodprMentionTags(content, mentionLookup),
+      ...buildFodprEmojiTags(content),
+    ]);
     setNoteText('');
     // 投稿後は入力欄を閉じる(デスクトップは表示を維持、モバイルはモーダルを閉じる)
     setMobileComposerOpen(false);
@@ -2325,10 +2704,124 @@ const t = setTimeout(() => {
     }
   }
 
-  // Nostr ログアウト
+  // NIP-07(ブラウザ拡張)でログインする。秘密鍵は拡張内に保持され、このクライアントは
+  // 公開鍵だけを localStorage へ保存してログイン状態を復元する。
+  async function handleNostrNip07Login() {
+    const ext = window.nostr;
+    if (!ext || typeof ext.getPublicKey !== 'function') {
+      throw new Error('NIP-07 対応のブラウザ拡張(Alby など)が見つかりません');
+    }
+    const pubkey = await ext.getPublicKey();
+    if (!/^[0-9a-f]{64}$/.test(pubkey)) throw new Error('拡張から取得した公開鍵が不正です');
+    setNostrNip07Pubkey(pubkey);
+    try {
+      localStorage.setItem(NIP07_PUBKEY_STORAGE_KEY, pubkey);
+    } catch {
+      /* 保存失敗は無視 */
+    }
+    // fsec 未ログインなら閲覧モードで入り、Nostr タブを表示する
+    if (!privKey) {
+      setGuestMode(true);
+      setActiveTab('nostr');
+      localStorage.setItem(NOSTR_GUEST_STORAGE_KEY, '1');
+    }
+  }
+
+  // NIP-79 (Nosskey / PRF direct usage)で新規にパスキーを作り Nostr 鍵を派生してログイン。
+  // 秘密鍵はパスキーの PRF でしか再生できないため、秘密鍵はメモリ上の nostrPrivKey に
+  // のみ保持する(keystore へ永続化しない)。
+  async function handleNostrPasskeyRegister() {
+    const { privKey, pubkey, credId } = await registerNosskeyPasskey();
+    // 不正な鍵(極めて稀)は prfToPrivateKey 内部で throw 済み
+    setNostrPrivKey(privKey);
+    setNostrPasskeyCred({ credId, pubkey });
+    try {
+      localStorage.setItem(NOSSKEY_CRED_STORAGE_KEY, JSON.stringify({ credId, pubkey }));
+    } catch {
+      /* 保存失敗は無視 */
+    }
+    if (!privKey) {
+      setGuestMode(true);
+      setActiveTab('nostr');
+      localStorage.setItem(NOSTR_GUEST_STORAGE_KEY, '1');
+    }
+  }
+
+   // NIP-79 (Nosskey)で登録済みのパスキーから WebAuthn 照証を要求し秘密鍵を再生してログイン。
+   // PRF は認証(生体)を伴うため、ページリロード後は毎回この手続きで再生する必要がある。
+   async function handleNostrPasskeyLogin() {
+     if (!nostrPasskeyCred) throw new Error('パスキー(credential)が登録されていません');
+     const { privKey } = await loginNosskeyPasskey(nostrPasskeyCred.credId);
+     setNostrPrivKey(privKey);
+     if (!privKey) {
+       setGuestMode(true);
+       setActiveTab('nostr');
+       localStorage.setItem(NOSTR_GUEST_STORAGE_KEY, '1');
+     }
+   }
+
+    // NIP-79 パスキー(credential)の登録情報を完全に削除する。
+    // 新しいパスキーを作ると新しい Nostr アイデンティティになるため、
+    // 切り替えたいときに使う。現在パスキーでログイン中ならログアウトも伴う。
+    function handleNostrPasskeyRemove() {
+      setNostrPasskeyCred(null);
+      try {
+        localStorage.removeItem(NOSSKEY_CRED_STORAGE_KEY);
+      } catch {
+        /* 無視 */
+      }
+      // ログイン中の方法がパスキーならセッションも破棄しログイン画面へ戻す
+      if (nostrLoginMethod === 'passkey') {
+        void clearNostrSecret();
+        setNostrPrivKey(null);
+        setNostrNip07Pubkey(null);
+        setNostrLocalEvents([]);
+        setNostrOpenPubkey(null);
+        setNostrReplyTarget(null);
+        setNostrQuoteTarget(null);
+        localStorage.removeItem(NOSTR_GUEST_STORAGE_KEY);
+        if (!privKey) setGuestMode(false);
+      }
+    }
+
+
+  // Nostr イベントへの署名。nsec を持っていればローカル署名、NIP-07 ログインなら
+  // ブラウザ拡張へ署名を依頼する。
+  async function signNostrEvent(ev: UnsignedNostrEvent): Promise<NostrEvent> {
+    if (nostrPrivKey) {
+      return signEventAsync(nostrPrivKey, ev);
+    }
+    const ext = window.nostr;
+    if (!ext || typeof ext.signEvent !== 'function' || !nostrNip07Pubkey) {
+      throw new Error('Nostr 署名に必要な鍵がありません(nsec または NIP-07 でログインしてください)');
+    }
+    const signed = await ext.signEvent({
+      kind: ev.kind,
+      tags: ev.tags,
+      content: ev.content,
+      created_at: ev.created_at,
+    });
+    return {
+      id: signed.id,
+      pubkey: signed.pubkey ?? nostrPubkeyHex,
+      created_at: signed.created_at ?? ev.created_at,
+      kind: ev.kind,
+      tags: ev.tags,
+      content: ev.content,
+      sig: signed.sig,
+    };
+  }
+
+  // Nostr ログアウト(nsec と NIP-07 の両方からログアウトする)
   function handleNostrLogout() {
     void clearNostrSecret();
     setNostrPrivKey(null);
+    setNostrNip07Pubkey(null);
+    try {
+      localStorage.removeItem(NIP07_PUBKEY_STORAGE_KEY);
+    } catch {
+      /* 無視 */
+    }
     setNostrLocalEvents([]);
     setNostrOpenPubkey(null);
     setNostrReplyTarget(null);
@@ -2372,7 +2865,7 @@ const t = setTimeout(() => {
     replyTarget?: { id: string; pubkey: string } | null,
     quoteTarget?: { id: string; pubkey: string } | null,
   ) {
-    if (!nostrPrivKey) return;
+    if (!nostrPubkeyHex) return;
     const content = text.trim();
     if (!content) return;
     const baseTags: NostrTags = replyTarget
@@ -2380,15 +2873,19 @@ const t = setTimeout(() => {
       : quoteTarget
         ? buildQuoteTags(quoteTarget.id, quoteTarget.pubkey)
         : [];
-    const tags = [...baseTags, ...buildNostrEmojiTags(content)];
+    const tags = [
+      ...baseTags,
+      ...buildNostrMentionPTags(content, buildNostrMentionLookup(nostrProfileMap)),
+      ...buildNostrEmojiTags(content),
+    ];
     const ev = makeNostrEvent(nostrPubkeyHex, Math.floor(Date.now() / 1000), 1, tags, content);
-    const signed = await signEventAsync(nostrPrivKey, ev);
+    const signed = await signNostrEvent(ev);
     nostrPublish(signed);
   }
 
   // Nostr リアクション(kind 7)。既に自分が反応していれば kind 5 で取り消す
   async function handleNostrReact(noteId: string, targetPubkey: string) {
-    if (!nostrPrivKey) return;
+    if (!nostrPubkeyHex) return;
     const existing = (nostrReactionMap.get(noteId) ?? []).find(
       (e) => e.pubkey === nostrPubkeyHex && ['❤️', '+'].includes(e.content.trim()),
     );
@@ -2403,13 +2900,13 @@ const t = setTimeout(() => {
       buildReactionTags(noteId, targetPubkey),
       '❤️',
     );
-    const signed = await signEventAsync(nostrPrivKey, ev);
+    const signed = await signNostrEvent(ev);
     nostrPublish(signed);
   }
 
   // Nostr リポスト(kind 6)。既にリポストしていれば kind 5 で取り消す
   async function handleNostrRepost(noteId: string, targetPubkey: string) {
-    if (!nostrPrivKey) return;
+    if (!nostrPubkeyHex) return;
     const existing = (nostrRepostMap.get(noteId) ?? []).find((e) => e.pubkey === nostrPubkeyHex);
     if (existing) {
       await handleNostrDelete(existing);
@@ -2425,15 +2922,15 @@ const t = setTimeout(() => {
       ],
       '',
     );
-    const signed = await signEventAsync(nostrPrivKey, ev);
+    const signed = await signNostrEvent(ev);
     nostrPublish(signed);
   }
 
   // Nostr 削除(kind 5)
   async function handleNostrDelete(ev: NostrEvent) {
-    if (!nostrPrivKey) return;
+    if (!nostrPubkeyHex) return;
     const del = makeNostrEvent(nostrPubkeyHex, Math.floor(Date.now() / 1000), 5, [['e', ev.id]], '');
-    const signed = await signEventAsync(nostrPrivKey, del);
+    const signed = await signNostrEvent(del);
     nostrPublish(signed);
   }
 
@@ -2441,16 +2938,15 @@ const t = setTimeout(() => {
   // nsec でログイン済みならそのまま、未ログインなら入力された nsec を使う。
   async function handleNostrImport(nsecInput?: string) {
     if (!privKey) throw new Error('先に fsec で Fodpr にログインしてください');
-    let nk = nostrPrivKey;
-    if (!nk && nsecInput && nsecInput.trim()) {
+    // 公開鍵は nsec / NIP-07 のどちらからでも取得できる(kind 0 は読むだけなので署名不要)
+    let pk = nostrPrivKey ? getPublicKeyFromSecret(nostrPrivKey) : nostrNip07Pubkey;
+    if (!pk && nsecInput && nsecInput.trim()) {
       const hex = normalizeNostrSecretKey(nsecInput);
-      getPublicKeyFromSecret(hex);
+      pk = getPublicKeyFromSecret(hex);
       await saveNostrSecret(hex);
       setNostrPrivKey(hex);
-      nk = hex;
     }
-    if (!nk) throw new Error('nsec を入力してください');
-    const pk = getPublicKeyFromSecret(nk);
+    if (!pk) throw new Error('nsec を入力するか、NIP-07 でログインしてください');
     const urls = nostrRelayUrls.length ? nostrRelayUrls : DEFAULT_NOSTR_RELAYS;
     const kind0 = await fetchNostrKind0(urls, pk);
     if (!kind0) throw new Error('Nostr にプロフィール(kind 0)が公開されていません');
@@ -2472,8 +2968,8 @@ const t = setTimeout(() => {
   // Nostr プロフィール(kind 0)を公開する。既存の metadata を引き継ぎつつ、
   // 入力された表示名・自己紹介・画像で上書きして全リレーへ投稿する。
   async function handleNostrSaveProfile(nameVal: string, aboutVal: string, pictureVal: string) {
-    if (!nostrPrivKey) throw new Error('先に nsec でログインしてください');
-    const pk = getPublicKeyFromSecret(nostrPrivKey);
+    if (!nostrPubkeyHex) throw new Error('先に nsec または NIP-07 でログインしてください');
+    const pk = nostrPubkeyHex;
     const existing = nostrProfileMap[pk];
     const prev = existing ? parseKind0Metadata(existing.content) : {};
     const trimmedName = nameVal.trim();
@@ -2488,7 +2984,7 @@ const t = setTimeout(() => {
       picture: pictureVal.trim() || undefined,
     });
     const ev = makeNostrEvent(pk, Math.floor(Date.now() / 1000), 0, [], content);
-    const signed = await signEventAsync(nostrPrivKey, ev);
+    const signed = await signNostrEvent(ev);
     nostrPublish(signed);
   }
 
@@ -2541,26 +3037,28 @@ const t = setTimeout(() => {
   if (!ready) {
     return (
       <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-bg text-gray-400">
-        <ThemeBackground theme={theme} />
         <p className="relative z-10 text-sm">読み込み中...</p>
       </div>
     );
   }
 
-  // 未ログイン(fsec なし)ならログイン画面を表示。鍵なしの閲覧モードも選べる。
-  if (!privKey && !guestMode) {
-    return (
-      <LoginScreen
-        theme={theme}
-        onLogin={handleLogin}
-        onGenerate={handleGenerate}
-        onNostrLogin={handleNostrLogin}
-        onNostrGenerate={handleGenerateNostr}
-        onGuest={handleGuest}
-        nostrLoggedIn={!!nostrPrivKey}
-      />
-    );
-  }
+   // 未ログイン(fsec なし)ならログイン画面を表示。鍵なしの閲覧モードも選べる。
+   if (!privKey && !guestMode) {
+     return (
+       <LoginScreen
+         onLogin={handleLogin}
+         onGenerate={handleGenerate}
+         onNostrLogin={handleNostrLogin}
+         onNostrNip07Login={handleNostrNip07Login}
+         onNostrGenerate={handleGenerateNostr}
+         onNostrPasskeyLogin={handleNostrPasskeyLogin}
+         onNostrPasskeyRegister={handleNostrPasskeyRegister}
+         passkeyRegistered={!!nostrPasskeyCred}
+         onGuest={handleGuest}
+         nostrLoggedIn={!!nostrPubkeyHex}
+       />
+     );
+   }
 
   const selfName = resolveDisplayName(pubkeyHex, profileMap);
 
@@ -2604,14 +3102,12 @@ const t = setTimeout(() => {
       ? privKey
         ? NAV_ITEMS
         : NAV_ITEMS.filter((i) => i.id === 'timeline' || i.id === 'settings')
-      : nostrPrivKey
+      : nostrPrivKey || nostrNip07Pubkey
         ? NOSTR_NAV_ITEMS
         : NOSTR_NAV_ITEMS.filter((i) => i.id !== 'profile');
 
   return (
     <div className="relative h-svh h-[100dvh] overflow-hidden bg-bg text-gray-100">
-      <ThemeBackground theme={theme} />
-
       <div className="relative z-10 flex h-full flex-col pt-[env(safe-area-inset-top)]">
         {/* ヘッダー */}
         <header className="flex flex-wrap items-center justify-center gap-2 px-3 py-2.5 sm:gap-3 sm:px-4 sm:py-3">
@@ -2649,11 +3145,16 @@ const t = setTimeout(() => {
                     setNostrOpenPubkey(null);
                   }}
                   className={
-                    'rounded-full px-3.5 py-1.5 text-sm transition-colors ' +
+                    'relative rounded-full px-3.5 py-1.5 text-sm transition-colors ' +
                     (view === item.id ? 'bg-white/15 text-white' : 'text-gray-300 hover:bg-white/10')
                   }
                 >
                   {item.label}
+                  {item.id === 'notifications' && unreadCountByTab[activeTab] > 0 && (
+                    <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-bg">
+                      {unreadCountByTab[activeTab] > 99 ? '99+' : unreadCountByTab[activeTab]}
+                    </span>
+                  )}
                 </button>
               ))}
             </nav>
@@ -2714,7 +3215,7 @@ const t = setTimeout(() => {
                       </button>
                     </>
                   )
-                ) : nostrPrivKey ? (
+                ) : nostrPrivKey || nostrNip07Pubkey ? (
                   <>
                     <Avatar
                       picture={nostrSelfPicture}
@@ -2763,6 +3264,9 @@ const t = setTimeout(() => {
                   onQuote={startQuote}
                   onReply={startReply}
                   onDelete={deleteEvent}
+                  mutedPubkeys={mutedPubkeys}
+                  onToggleMute={toggleMute}
+                  mentionLookup={mentionLookup}
                 />
               )}
               {!openPubkey && view === 'timeline' && (
@@ -2791,6 +3295,8 @@ const t = setTimeout(() => {
                         relayConnected={relay.connected}
                         mediaType={mediaType}
                         mediaThumbnail={mediaThumbnail}
+                        emojis={pickerEmojis}
+                        mentionUsers={mentionUsers(profileMap)}
                       />
                     </LiquidGlass>
                   )}
@@ -2805,6 +3311,8 @@ const t = setTimeout(() => {
                     reactions={reactionMap}
                     selfPubkeyHex={pubkeyHex}
                     selfRepostTargets={selfRepostTargets}
+                    mutedPubkeys={mutedPubkeys}
+                    mentionLookup={mentionLookup}
                     onOpenUser={setOpenPubkey}
                     onReact={handleReact}
                     onUndoReact={handleUndoReact}
@@ -2845,6 +3353,7 @@ const t = setTimeout(() => {
                   nostrReactions={nostrReactionMap}
                   nostrReposts={nostrRepostMap}
                   noteById={nostrNoteById}
+                  mentionLookup={mentionLookup}
                 />
               )}
               {view === 'profile' && (
@@ -2859,7 +3368,7 @@ const t = setTimeout(() => {
                   onAboutChange={setAbout}
                   onSave={postProfile}
                   relayConnected={relay.connected}
-                  nostrLoggedIn={!!nostrPrivKey}
+                  nostrLoggedIn={!!nostrPrivKey || !!nostrNip07Pubkey}
                   onNostrImport={handleNostrImport}
                 />
               )}
@@ -2872,12 +3381,13 @@ const t = setTimeout(() => {
                   onLogout={handleLogout}
                   onShowDocs={openDocs}
                   secretHex={privKey}
-                  theme={theme}
-                  onThemeChange={changeTheme}
                   browserNotifEnabled={browserNotifEnabled}
                   notifPermission={notifPermission}
                   onToggleBrowserNotif={setBrowserNotifsEnabled}
                   onRequestNotifPermission={requestNotificationPermission}
+                  mutedPubkeys={mutedPubkeys}
+                  onToggleMute={toggleMute}
+                  profileMap={profileMap}
                 />
               )}
             </>
@@ -2892,6 +3402,9 @@ const t = setTimeout(() => {
                   onClose={() => setNostrOpenPubkey(null)}
                   ownRelayUrls={nostrRelayUrls}
                   onAddRelay={(url) => updateNostrRelays([...nostrRelayUrls, url])}
+                  mutedPubkeys={mutedPubkeys}
+                  onToggleMute={toggleMute}
+                  onOpenUser={setNostrOpenPubkey}
                 />
               )}
               {!nostrOpenPubkey && view === 'timeline' && (
@@ -2902,7 +3415,7 @@ const t = setTimeout(() => {
                   reposts={nostrRepostMap}
                   profileMap={nostrProfileMap}
                   selfPubkeyHex={nostrPubkeyHex}
-                  loggedIn={!!nostrPrivKey}
+                  loggedIn={!!nostrPrivKey || !!nostrNip07Pubkey}
                   relayConnected={nostrRelay.connected}
                   onOpenUser={setNostrOpenPubkey}
                   onReact={handleNostrReact}
@@ -2920,6 +3433,9 @@ const t = setTimeout(() => {
                   onCancelQuote={() => setNostrQuoteTarget(null)}
                   noteById={nostrNoteById}
                   onOpenImage={(url) => setImageOverlayUrl(url)}
+                  emojis={pickerEmojis}
+                  mutedPubkeys={mutedPubkeys}
+                  mentionLookup={nostrMentionLookup}
                 />
               )}
               {!nostrOpenPubkey && view === 'notifications' && (
@@ -2951,6 +3467,7 @@ const t = setTimeout(() => {
                   links={links}
                   nostrReplyMap={nostrReplyMap}
                   nostrRepostMap={nostrRepostMap}
+                  mentionLookup={mentionLookup}
                 />
               )}
               {!nostrOpenPubkey && view === 'profile' && (
@@ -2962,19 +3479,24 @@ const t = setTimeout(() => {
                   onSave={handleNostrSaveProfile}
                 />
               )}
-              {view === 'settings' && (
-                 <NostrSettingsView
-                   relayUrls={nostrRelayUrls}
-                   onRelayChange={updateNostrRelays}
-                   relayStatus={nostrRelay.relayStatus}
-                   relayConnected={nostrRelay.connected}
-                   onLogout={handleNostrLogout}
-                   secretHex={nostrPrivKey}
-                   relayList={nostrRelayList}
-                   theme={theme}
-                   onThemeChange={changeTheme}
-                 />
-               )}
+               {view === 'settings' && (
+                  <NostrSettingsView
+                    relayUrls={nostrRelayUrls}
+                    onRelayChange={updateNostrRelays}
+                    relayStatus={nostrRelay.relayStatus}
+                    relayConnected={nostrRelay.connected}
+                    onLogout={handleNostrLogout}
+                    secretHex={nostrPrivKey}
+                    nip07Pubkey={nostrNip07Pubkey}
+                    loginMethod={nostrLoginMethod}
+                    passkeyCred={nostrPasskeyCred}
+                    onNostrPasskeyRemove={handleNostrPasskeyRemove}
+                    relayList={nostrRelayList}
+                    mutedPubkeys={mutedPubkeys}
+                    onToggleMute={toggleMute}
+                    profileMap={nostrProfileMap}
+                  />
+                )}
             </>
           )}
         </main>
@@ -3031,6 +3553,8 @@ const t = setTimeout(() => {
                       relayConnected={relay.connected}
                       mediaType={mediaType}
                       mediaThumbnail={mediaThumbnail}
+                      emojis={pickerEmojis}
+                      mentionUsers={mentionUsers(profileMap)}
                     />
                   </LiquidGlass>
                 </div>
@@ -3113,6 +3637,7 @@ function PostCard({
   onReply,
   onDelete,
   embedded = false,
+  mentionLookup,
 }: {
   e: FodprEvent;
   profileMap: Record<string, FodprEvent>;
@@ -3129,6 +3654,7 @@ function PostCard({
   onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
   selfRepostTargets: Set<string>;
   embedded?: boolean;
+  mentionLookup: Map<string, MentionUser>;
 }) {
   const pkHex = CryptoUtils.bytesToHex(e.pubkey);
   const name = resolveDisplayName(pkHex, profileMap);
@@ -3192,7 +3718,7 @@ function PostCard({
             )}
             {caption && (
               <p className="mt-2 text-lg leading-relaxed whitespace-pre-wrap break-words sm:text-xl">
-                {renderCustomEmojis(caption, parseFodprEmojiTags(e.tags))}
+                {renderFodprContent(caption, parseFodprEmojiTags(e.tags), mentionLookup, onOpenUser)}
               </p>
             )}
             {isVideo ? (
@@ -3279,7 +3805,7 @@ function PostCard({
             </div>
           )}
           <p className="mt-2 text-lg leading-relaxed whitespace-pre-wrap break-words sm:text-xl">
-            {renderCustomEmojis(e.content, parseFodprEmojiTags(e.tags))}
+            {renderFodprContent(e.content, parseFodprEmojiTags(e.tags), mentionLookup, onOpenUser)}
           </p>
           <PostActions
             targetKey={key}
@@ -3327,6 +3853,8 @@ function Composer({
   relayConnected,
   mediaType,
   mediaThumbnail,
+  emojis,
+  mentionUsers,
 }: {
   noteText: string;
   setNoteText: (v: string) => void;
@@ -3348,9 +3876,52 @@ function Composer({
   relayConnected: boolean;
   mediaType: 'image' | 'video' | 'file' | null;
   mediaThumbnail: string | null;
+  emojis: CustomEmojiDef[];
+  mentionUsers: MentionUser[];
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const noteRef = useRef<HTMLTextAreaElement>(null);
+
+  // @メンションの自動補完: カーソル直前の「@...」をクエリにして候補を表示する
+  const [atQuery, setAtQuery] = useState<string | null>(null);
+  const [atStart, setAtStart] = useState(0);
+  const [atIndex, setAtIndex] = useState(0);
+  const atCandidates = useMemo(() => {
+    if (atQuery === null) return [];
+    const q = atQuery.toLowerCase();
+    return mentionUsers
+      .filter((u) => u.name.toLowerCase().includes(q) || u.pk.toLowerCase().startsWith(q))
+      .slice(0, 8);
+  }, [atQuery, mentionUsers]);
+
+  // カーソル位置の直前の単語が @ で始まる場合、補完状態を更新する
+  function updateAtState(textarea: HTMLTextAreaElement) {
+    const value = textarea.value;
+    const pos = textarea.selectionStart;
+    const head = value.slice(0, pos);
+    const m = /@([^\s@,。、!！?？;；]*)$/.exec(head);
+    if (m) {
+      const start = pos - m[0].length;
+      setAtStart(start);
+      setAtQuery(m[1]);
+      setAtIndex(0);
+    } else {
+      setAtQuery(null);
+    }
+  }
+
+  function selectMention(u: MentionUser) {
+    if (atQuery === null || !noteRef.current) return;
+    const ta = noteRef.current;
+    const next = ta.value.slice(0, atStart) + '@' + u.name + ta.value.slice(ta.selectionStart);
+    setNoteText(next);
+    setAtQuery(null);
+    // カーソルを挿入末尾へ移動
+    requestAnimationFrame(() => {
+      ta.focus();
+      ta.selectionStart = ta.selectionEnd = atStart + u.name.length + 1;
+    });
+  }
 
   // 引用/返信モードに入ったら入力欄へ自動でフォーカスする
   useEffect(() => {
@@ -3408,20 +3979,67 @@ function Composer({
         </div>
       )}
       <div className="flex items-end gap-3">
-        <textarea
-          ref={noteRef}
-          className="max-h-40 flex-1 resize-none rounded-xl bg-black/30 p-3 text-base text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-white/25"
-          placeholder={replyTarget ? '返信を投稿する...' : quoteTarget ? '引用して投稿する...' : '何か投稿する...'}
-          value={noteText}
-          onChange={(e) => setNoteText(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-              e.preventDefault();
-              void onSubmit();
-            }
-          }}
-          rows={2}
-        />
+        <div className="relative min-w-0 flex-1">
+          <textarea
+            ref={noteRef}
+            className="max-h-40 w-full resize-none rounded-xl bg-black/30 p-3 text-base text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-white/25"
+            placeholder={replyTarget ? '返信を投稿する...' : quoteTarget ? '引用して投稿する...' : '何か投稿する...'}
+            value={noteText}
+            onChange={(e) => {
+              setNoteText(e.target.value);
+              updateAtState(e.target);
+            }}
+            onKeyDown={(e) => {
+              if (atQuery !== null && atCandidates.length > 0) {
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  setAtIndex((i) => (i + 1) % atCandidates.length);
+                  return;
+                }
+                if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  setAtIndex((i) => (i - 1 + atCandidates.length) % atCandidates.length);
+                  return;
+                }
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  selectMention(atCandidates[atIndex]);
+                  return;
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setAtQuery(null);
+                  return;
+                }
+              }
+              if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                e.preventDefault();
+                void onSubmit();
+              }
+            }}
+            rows={2}
+          />
+          {atQuery !== null && atCandidates.length > 0 && (
+            <div className="absolute left-0 right-0 top-full z-20 mt-1 overflow-hidden rounded-xl border border-white/10 bg-bg/95 shadow-lg backdrop-blur">
+              {atCandidates.map((u, i) => (
+                <button
+                  key={u.pk}
+                  onClick={() => selectMention(u)}
+                  onMouseEnter={() => setAtIndex(i)}
+                  className={
+                    'flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ' +
+                    (i === atIndex ? 'bg-white/10' : 'hover:bg-white/5')
+                  }
+                >
+                  <span className={'shrink-0 text-primary ' + (i === atIndex ? 'text-primary-hover' : '')}>
+                    @{u.name}
+                  </span>
+                  <span className="ml-auto shrink-0 font-mono text-[10px] text-gray-500">{u.pk.slice(0, 8)}…</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
         <div className="flex shrink-0 gap-2">
           <button
             onClick={() => fileRef.current?.click()}
@@ -3431,6 +4049,7 @@ function Composer({
             添付
           </button>
           <EmojiPicker
+            emojis={emojis}
             onPick={(def) => {
               if (noteRef.current) setNoteText(insertTextAtCursor(noteRef.current, `:${def.shortcode}:`));
             }}
@@ -3755,6 +4374,7 @@ function SharedCard({
   onReply,
   onDelete,
   depth,
+  mentionLookup,
 }: {
   e: FodprEvent;
   profileMap: Record<string, FodprEvent>;
@@ -3772,6 +4392,7 @@ function SharedCard({
   onReply: (targetKey: string) => void;
   onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
   depth: number;
+  mentionLookup: Map<string, MentionUser>;
 }) {
   const pkHex = CryptoUtils.bytesToHex(e.pubkey);
   const name = resolveDisplayName(pkHex, profileMap);
@@ -3796,7 +4417,7 @@ function SharedCard({
         </div>
         {isQuote && e.content.trim() && (
           <p className="mb-2 whitespace-pre-wrap break-words px-1 text-lg leading-relaxed text-gray-100 sm:text-xl">
-            {renderCustomEmojis(e.content, parseFodprEmojiTags(e.tags))}
+            {renderFodprContent(e.content, parseFodprEmojiTags(e.tags), mentionLookup, onOpenUser)}
           </p>
         )}
         {target ? (
@@ -3818,6 +4439,7 @@ function SharedCard({
               onReply={onReply}
               onDelete={onDelete}
               depth={depth + 1}
+              mentionLookup={mentionLookup}
             />
           </div>
         ) : (
@@ -3849,6 +4471,7 @@ function TimelineCard({
   onReply,
   onDelete,
   depth = 0,
+  mentionLookup,
 }: {
   e: FodprEvent;
   profileMap: Record<string, FodprEvent>;
@@ -3866,6 +4489,7 @@ function TimelineCard({
   onReply: (targetKey: string) => void;
   onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
   depth?: number;
+  mentionLookup: Map<string, MentionUser>;
 }) {
   const card =
     repostTarget(e) || quoteTargetOf(e) ? (
@@ -3891,6 +4515,7 @@ function TimelineCard({
           onReply={onReply}
           onDelete={onDelete}
           depth={depth}
+          mentionLookup={mentionLookup}
         />
       )
     ) : (
@@ -3910,6 +4535,7 @@ function TimelineCard({
         onReply={onReply}
         onDelete={onDelete}
         embedded={depth > 0}
+        mentionLookup={mentionLookup}
       />
     );
 
@@ -3934,6 +4560,7 @@ function TimelineCard({
           onQuote={onQuote}
           onReply={onReply}
           onDelete={onDelete}
+          mentionLookup={mentionLookup}
         />
       </div>
     );
@@ -3962,6 +4589,7 @@ function ReplyThread({
   onReply,
   onDelete,
   depth = 0,
+  mentionLookup,
 }: {
   targetKey: string;
   replies: ReplyMap;
@@ -3979,6 +4607,7 @@ function ReplyThread({
   onReply: (targetKey: string) => void;
   onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
   depth?: number;
+  mentionLookup: Map<string, MentionUser>;
 }) {
   if (depth > 4) return null;
   const list = (replies.get(targetKey) ?? [])
@@ -4012,7 +4641,7 @@ function ReplyThread({
             />
           </div>
             <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-100">
-              {renderCustomEmojis(r.content, parseFodprEmojiTags(r.tags))}
+              {renderFodprContent(r.content, parseFodprEmojiTags(r.tags), mentionLookup, onOpenUser)}
             </p>
             {parentName && (
               <p className="mt-1 text-xs text-gray-500">
@@ -4052,6 +4681,7 @@ function ReplyThread({
               onReply={onReply}
               onDelete={onDelete}
               depth={depth + 1}
+              mentionLookup={mentionLookup}
             />
           </div>
         );
@@ -4074,6 +4704,7 @@ function Timeline({
   eventByKey,
   selfPubkeyHex,
   selfRepostTargets,
+  mutedPubkeys,
   onOpenUser,
   onReact,
   onUndoReact,
@@ -4082,6 +4713,7 @@ function Timeline({
   onQuote,
   onReply,
   onDelete,
+  mentionLookup,
 }: {
   notes: FodprEvent[];
   binaries: FodprEvent[];
@@ -4093,6 +4725,7 @@ function Timeline({
   eventByKey: Map<string, FodprEvent>;
   selfPubkeyHex: string;
   selfRepostTargets: Set<string>;
+  mutedPubkeys: Set<string>;
   onOpenUser: (pubkeyHex: string) => void;
   onReact: (targetKey: string, emoji: string) => void;
   onUndoReact: (targetKey: string) => void;
@@ -4101,9 +4734,12 @@ function Timeline({
   onQuote: (targetKey: string) => void;
   onReply: (targetKey: string) => void;
   onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
+  mentionLookup: Map<string, MentionUser>;
 }) {
-  // テキスト/画像/共有を統合して最新順(上=最新)に並べる
-  const posts = sortPostsDesc([...notes, ...binaries, ...links]);
+  // テキスト/画像/共有を統合して最新順(上=最新)に並べる(ミュート除外)
+  const posts = sortPostsDesc([...notes, ...binaries, ...links]).filter(
+    (e) => !mutedPubkeys.has(CryptoUtils.bytesToHex(e.pubkey)),
+  );
 
   // リレーにまだ対象投稿が無いリプライ(親が未取得)は末尾にフォールバック表示する
   const orphanReplies = [...replies.values()]
@@ -4112,13 +4748,18 @@ function Timeline({
       const k = replyTag(r);
       return !k || !eventByKey.has(k);
     })
-    .sort((a, b) => b.createdAt - a.createdAt);
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .filter((r) => !mutedPubkeys.has(CryptoUtils.bytesToHex(r.pubkey)));
+
+  // 大量取得時の描画負荷を抑えるため、初期表示は先頭 80 件に制限し「さらに表示」で増やす
+  const [visible, setVisible] = useState(80);
+  useEffect(() => setVisible(80), [posts.length, orphanReplies.length]);
 
   return (
     <div className="space-y-3">
       {posts.length === 0 && <p className="pt-8 text-center text-sm text-gray-500">まだ投稿はありません</p>}
 
-      {posts.map((e) => (
+      {posts.slice(0, visible).map((e) => (
         <TimelineCard
           key={dedupeKey(e)}
           e={e}
@@ -4136,8 +4777,18 @@ function Timeline({
           onQuote={onQuote}
           onReply={onReply}
           onDelete={onDelete}
+          mentionLookup={mentionLookup}
         />
       ))}
+
+      {posts.length > visible && (
+        <button
+          onClick={() => setVisible((v) => v + 80)}
+          className="w-full rounded-xl border border-white/10 bg-black/30 py-3 text-sm text-gray-300 transition-colors hover:bg-white/10"
+        >
+          さらに表示 ({posts.length - visible} 件)
+        </button>
+      )}
 
       {orphanReplies.length > 0 && (
         <div className="space-y-2 pt-2">
@@ -4160,6 +4811,7 @@ function Timeline({
               onQuote={onQuote}
               onReply={onReply}
               onDelete={onDelete}
+              mentionLookup={mentionLookup}
             />
           ))}
         </div>
@@ -4198,6 +4850,7 @@ function NostrNoteCard({
    onDelete,
    noteById,
    onOpenImage,
+   mentionLookup,
   }: {
 
   e: NostrEvent;
@@ -4214,6 +4867,7 @@ function NostrNoteCard({
   onDelete: (ev: NostrEvent) => void;
   noteById?: Record<string, NostrEvent>;
   onOpenImage?: (url: string) => void;
+  mentionLookup?: Map<string, { pk: string; name: string }> | null;
 }) {
   const [repostMenuOpen, setRepostMenuOpen] = useState(false);
   const repostBtnRef = useRef<HTMLButtonElement>(null);
@@ -4274,7 +4928,7 @@ function NostrNoteCard({
             )}
           </div>
           <p className="mt-2 text-lg leading-relaxed whitespace-pre-wrap break-words sm:text-xl">
-            {renderNostrContent(contentText, parseNostrEmojiTags(e.tags), noteById ?? null)}
+            {renderNostrContent(contentText, parseNostrEmojiTags(e.tags), noteById ?? null, mentionLookup ?? null, onOpenUser)}
           </p>
           {imgs.length > 0 && (
             <div className="mt-2 space-y-2">
@@ -4402,6 +5056,7 @@ function NostrReplyThread({
    onDelete,
    noteById,
    onOpenImage,
+   mentionLookup,
    depth = 0,
   }: {
   targetId: string;
@@ -4419,6 +5074,7 @@ function NostrReplyThread({
   onDelete: (ev: NostrEvent) => void;
   noteById?: Record<string, NostrEvent>;
   onOpenImage?: (url: string) => void;
+  mentionLookup?: Map<string, { pk: string; name: string }> | null;
   depth?: number;
 }) {
   if (depth > 4) return null;
@@ -4447,6 +5103,7 @@ function NostrReplyThread({
             onDelete={onDelete}
             noteById={noteById}
             onOpenImage={onOpenImage}
+            mentionLookup={mentionLookup}
           />
           <NostrReplyThread
             targetId={r.id}
@@ -4464,6 +5121,7 @@ function NostrReplyThread({
             onDelete={onDelete}
             noteById={noteById}
             onOpenImage={onOpenImage}
+            mentionLookup={mentionLookup}
             depth={depth + 1}
           />
         </div>
@@ -4497,6 +5155,9 @@ function NostrTimeline({
    onCancelQuote,
    noteById: noteByIdProp,
    onOpenImage,
+   emojis,
+   mutedPubkeys,
+   mentionLookup,
 }: {
   notes: NostrEvent[];
   replies: Map<string, NostrEvent[]>;
@@ -4523,6 +5184,9 @@ function NostrTimeline({
    onCancelQuote: () => void;
    noteById: Record<string, NostrEvent>;
    onOpenImage: (url: string) => void;
+   emojis: CustomEmojiDef[];
+   mutedPubkeys: Set<string>;
+   mentionLookup?: Map<string, { pk: string; name: string }> | null;
 }) {
   const [text, setText] = useState('');
   const noteRef = useRef<HTMLTextAreaElement>(null);
@@ -4534,15 +5198,17 @@ function NostrTimeline({
 
   const noteIds = useMemo(() => new Set(notes.map((n) => n.id)), [notes]);
   // e タグが無いノート、または対象イベントが未取得のノートをトップレベル表示する
+  // (ミュート中のユーザーは除外)
   const roots = useMemo(
     () =>
       sortNostrDesc(
         notes.filter((n) => {
+          if (mutedPubkeys.has(n.pubkey)) return false;
           const p = firstETag(n);
           return !p || !noteIds.has(p);
         }),
       ),
-    [notes, noteIds],
+    [notes, noteIds, mutedPubkeys],
   );
 
   const replyNote = replyTarget ? notes.find((n) => n.id === replyTarget.id) : undefined;
@@ -4551,6 +5217,10 @@ function NostrTimeline({
   const quoteName = quoteNote ? nostrDisplayName(quoteNote.pubkey, profileMap) : undefined;
 
   const noteById = noteByIdProp ?? Object.fromEntries(notes.map((n) => [n.id, n]));
+
+  // 大量取得時の描画負荷を抑えるため、初期表示は先頭 80 件に制限し「さらに表示」で増やす
+  const [visible, setVisible] = useState(80);
+  useEffect(() => setVisible(80), [roots]);
 
   function submit() {
     const t = text.trim();
@@ -4596,6 +5266,7 @@ function NostrTimeline({
             <div className="mt-2 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <EmojiPicker
+                  emojis={emojis}
                   onPick={(def) => {
                     if (noteRef.current) setText(insertTextAtCursor(noteRef.current, `:${def.shortcode}:`));
                   }}
@@ -4621,7 +5292,7 @@ function NostrTimeline({
       {roots.length === 0 ? (
         <p className="pt-8 text-center text-sm text-gray-500">まだ投稿はありません</p>
       ) : (
-        roots.map((n) => (
+        roots.slice(0, visible).map((n) => (
           <div key={n.id} className="space-y-2">
             <NostrNoteCard
               e={n}
@@ -4638,6 +5309,7 @@ function NostrTimeline({
                onDelete={onDelete}
                noteById={noteById}
                onOpenImage={onOpenImage}
+               mentionLookup={mentionLookup}
              />
              <NostrReplyThread
                targetId={n.id}
@@ -4655,9 +5327,20 @@ function NostrTimeline({
                onDelete={onDelete}
                noteById={noteById}
                onOpenImage={onOpenImage}
+               mentionLookup={mentionLookup}
              />
           </div>
         ))
+      )}
+      {roots.length > visible && (
+        <div className="pt-1">
+          <button
+            onClick={() => setVisible((v) => v + 80)}
+            className="w-full rounded-xl border border-white/10 bg-black/30 py-3 text-sm text-gray-300 transition-colors hover:bg-white/10"
+          >
+            さらに表示 ({roots.length - visible} 件)
+          </button>
+        </div>
       )}
     </div>
   );
@@ -4674,6 +5357,9 @@ function NostrUserModal({
   onClose,
   ownRelayUrls,
   onAddRelay,
+  mutedPubkeys,
+  onToggleMute,
+  onOpenUser,
 }: {
   pubkey: string;
   profileMap: Record<string, NostrEvent>;
@@ -4682,6 +5368,9 @@ function NostrUserModal({
   onClose: () => void;
   ownRelayUrls: string[];
   onAddRelay: (url: string) => void;
+  mutedPubkeys: Set<string>;
+  onToggleMute: (pubkey: string) => void;
+  onOpenUser: (pubkey: string) => void;
 }) {
   const profileEv = profileMap[pubkey];
   const meta = parseKind0Metadata(profileEv?.content ?? '');
@@ -4720,12 +5409,25 @@ function NostrUserModal({
       <div className="fixed left-1/2 top-1/2 z-50 max-h-[85vh] w-[min(92vw,36rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-white/15 bg-[#14161a] p-5 shadow-xl">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold text-white">{name}</h2>
-          <button
-            onClick={onClose}
-            className="rounded-full border border-white/15 px-3 py-1.5 text-xs text-gray-300 transition-colors hover:bg-white/10"
-          >
-            閉じる
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => onToggleMute(pubkey)}
+              className={
+                'rounded-full border px-3 py-1.5 text-xs transition-colors ' +
+                (mutedPubkeys.has(pubkey)
+                  ? 'border-primary/60 bg-primary/10 text-primary'
+                  : 'border-white/15 text-gray-300 hover:bg-white/10')
+              }
+            >
+              {mutedPubkeys.has(pubkey) ? 'ミュート解除' : 'ミュート'}
+            </button>
+            <button
+              onClick={onClose}
+              className="rounded-full border border-white/15 px-3 py-1.5 text-xs text-gray-300 transition-colors hover:bg-white/10"
+            >
+              閉じる
+            </button>
+          </div>
         </div>
         <div className="mt-3 flex items-center gap-3">
           <Avatar picture={meta.picture ?? null} pubkeyHex={pubkey} name={name} className="h-14 w-14 text-xl" />
@@ -4779,7 +5481,7 @@ function NostrUserModal({
              myNotes.map((n) => (
                <div key={n.id} className="rounded-xl border border-white/10 bg-black/20 p-3">
                  <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-100">
-                   {renderNostrContent(n.content, parseNostrEmojiTags(n.tags), userNoteById)}
+                   {renderNostrContent(n.content, parseNostrEmojiTags(n.tags), userNoteById, buildNostrMentionLookup(profileMap), onOpenUser)}
                  </p>
                  <p className="mt-1 text-xs text-gray-500">{new Date(n.created_at * 1000).toLocaleString()}</p>
                </div>
@@ -4802,23 +5504,45 @@ function NostrSettingsView({
   relayConnected,
   onLogout,
   secretHex,
+  nip07Pubkey,
+  loginMethod,
+  passkeyCred,
+  onNostrPasskeyRemove,
   relayList,
-  theme,
-  onThemeChange,
+  mutedPubkeys,
+  onToggleMute,
+  profileMap,
 }: {
   relayUrls: string[];
   onRelayChange: (urls: string[]) => void;
   relayStatus: NostrRelayStatus[];
-  relayConnected: boolean;
-  onLogout: () => void;
-  secretHex: string | null;
-  relayList: RelayList | null;
-  theme: ThemeId;
-  onThemeChange: (t: ThemeId) => void;
+   relayConnected: boolean;
+   onLogout: () => void;
+   secretHex: string | null;
+   nip07Pubkey: string | null;
+   loginMethod: 'nsec' | 'nip07' | 'passkey' | null;
+   passkeyCred: NosskeyCred | null;
+   onNostrPasskeyRemove: () => void;
+   relayList: RelayList | null;
+   mutedPubkeys: Set<string>;
+   onToggleMute: (pubkeyHex: string) => void;
+   profileMap: Record<string, NostrEvent>;
 }) {
   const [relayInput, setRelayInput] = useState('');
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+
+  // ログイン方法に応じた表示用 pubkey(np)と説明文
+  const loggedPubkey = secretHex
+    ? getPublicKeyFromSecret(secretHex)
+    : nip07Pubkey ?? passkeyCred?.pubkey ?? null;
+  const loginNote = loginMethod === 'nsec'
+    ? 'nsec でログイン中'
+    : loginMethod === 'nip07'
+      ? 'ブラウザ拡張 (NIP-07) でログイン中'
+      : loginMethod === 'passkey'
+        ? 'パスキー (Nosskey) でログイン中 ※メモリのみ'
+        : null;
 
   // NIP-65 リレーリストの全 URL を接続先リレーへ追加する
   function importRelays() {
@@ -4834,7 +5558,7 @@ function NostrSettingsView({
     setErr(null);
   }
 
-  const npub = useMemo(() => (secretHex ? hexToNpub(getPublicKeyFromSecret(secretHex)) : null), [secretHex]);
+  const npub = useMemo(() => (loggedPubkey ? hexToNpub(loggedPubkey) : null), [loggedPubkey]);
   const maskedNsec = useMemo(() => {
     if (!secretHex) return null;
     const nsec = hexToNsec(secretHex);
@@ -4872,28 +5596,6 @@ function NostrSettingsView({
       <LiquidGlass intensity="subtle" refractive className="liquid-glass--card w-full">
         <div className="space-y-4 p-5">
           <h2 className="text-lg font-semibold text-white">Nostr 設定</h2>
-
-          <div className="space-y-2">
-            <p className="text-xs text-gray-400">テーマ</p>
-            <div className="grid grid-cols-2 gap-2">
-              {THEME_OPTIONS.map((opt) => (
-                <button
-                  key={opt.id}
-                  onClick={() => onThemeChange(opt.id)}
-                  aria-pressed={theme === opt.id}
-                  className={
-                    'rounded-xl border px-3 py-2.5 text-left transition-colors ' +
-                    (theme === opt.id
-                      ? 'border-primary bg-primary/10 text-white'
-                      : 'border-white/15 bg-black/20 text-gray-300 hover:bg-white/10')
-                  }
-                >
-                  <span className="block text-sm font-semibold">{opt.label}</span>
-                  <span className="mt-0.5 block text-xs text-gray-400">{opt.desc}</span>
-                </button>
-              ))}
-            </div>
-          </div>
 
           <div className="space-y-2">
             <label className="block text-xs text-gray-400">Nostr リレー (複数登録可)</label>
@@ -4940,8 +5642,15 @@ function NostrSettingsView({
         </div>
       </LiquidGlass>
 
+      {/* ミュート中のユーザー一覧 */}
+      <MuteListCard
+        mutedPubkeys={mutedPubkeys}
+        onToggleMute={onToggleMute}
+        displayNames={Object.fromEntries(Object.keys(profileMap).map((pk) => [pk, nostrDisplayName(pk, profileMap) ?? pk]))}
+      />
+
       {/* NIP-65 リレーリスト(kind 10002) */}
-      {secretHex && (
+      {loggedPubkey && (
         <LiquidGlass intensity="subtle" refractive={false} className="liquid-glass--card w-full">
           <div className="space-y-3 p-4">
             <p className="text-sm font-medium text-white">NIP-65 リレーリスト (kind 10002)</p>
@@ -4983,36 +5692,77 @@ function NostrSettingsView({
         </LiquidGlass>
       )}
 
-      {/* nsec ログイン状態 */}
+      {/* ログイン状態 */}
       <LiquidGlass intensity="subtle" refractive={false} className="liquid-glass--card w-full">
         <div className="space-y-3 p-4">
-          {secretHex ? (
-            <>
-              <div className="space-y-1.5">
-                <p className="text-sm font-medium text-white">Nostr ログイン中</p>
-                <p className="break-all text-xs text-gray-400">{npub}</p>
-                <code className="block break-all rounded-xl bg-black/30 px-3 py-2.5 text-xs text-gray-300">
-                  {maskedNsec}
-                </code>
-              </div>
-              <div className="flex items-center justify-between border-t border-white/10 pt-3">
-                <div>
-                  <p className="text-sm font-medium text-white">nsec をログアウト</p>
-                  <p className="mt-0.5 text-xs text-gray-400">ローカルの Nostr 秘密鍵を削除します</p>
-                </div>
-                <button
-                  onClick={onLogout}
-                  className="rounded-xl border border-red-400/40 px-4 py-2 text-sm text-red-300 transition-colors hover:bg-red-400/10"
-                >
-                  ログアウト
-                </button>
-              </div>
-            </>
-          ) : (
-            <p className="text-sm text-gray-400">
-              nsec でログインしていません。ログイン画面の Nostr (nsec) タブからログインできます。
-            </p>
-          )}
+           {loggedPubkey ? (
+             <>
+               <div className="space-y-1.5">
+                 <p className="text-sm font-medium text-white">Nostr ログイン中 ({loginNote})</p>
+                 <p className="break-all text-xs text-gray-400">{npub}</p>
+                 {loginMethod === 'nsec' && secretHex && (
+                   <code className="block break-all rounded-xl bg-black/30 px-3 py-2.5 text-xs text-gray-300">
+                     {maskedNsec}
+                   </code>
+                 )}
+               </div>
+               <div className="flex items-center justify-between border-t border-white/10 pt-3">
+                 <div>
+                   <p className="text-sm font-medium text-white">Nostr をログアウト</p>
+                   <p className="mt-0.5 text-xs text-gray-400">
+                     {loginMethod === 'nsec'
+                       ? 'ローカルの Nostr 秘密鍵を削除します'
+                       : loginMethod === 'nip07'
+                         ? 'ブラウザ拡張 (NIP-07) のログイン状態を解除します'
+                          : 'パスキー (Nosskey) の再照認を要求します(メモリ上の秘密鍵を消去)'}
+                   </p>
+                 </div>
+                 <button
+                   onClick={onLogout}
+                   className="rounded-xl border border-red-400/40 px-4 py-2 text-sm text-red-300 transition-colors hover:bg-red-400/10"
+                 >
+                   ログアウト
+                 </button>
+               </div>
+
+               {/* NIP-79 パスキー(credential)の管理: 登録済みなら削除(新規登録でアイデンティティ切替) */}
+               {passkeyCred && (
+                 <div className="flex items-center justify-between border-t border-white/10 pt-3">
+                   <div>
+                     <p className="text-sm font-medium text-white">パスキー (Nosskey) 登録を削除</p>
+                     <p className="mt-0.5 text-xs text-gray-400">
+                       保存済みパスキー credential を忘れます(新規登録で別アイデンティティ)
+                     </p>
+                   </div>
+                   <button
+                     onClick={onNostrPasskeyRemove}
+                     className="rounded-xl border border-orange-400/40 px-4 py-2 text-sm text-orange-300 transition-colors hover:bg-orange-400/10"
+                   >
+                     削除
+                   </button>
+                 </div>
+               )}
+             </>
+           ) : passkeyCred ? (
+             <div className="flex items-center justify-between">
+               <div>
+                 <p className="text-sm font-medium text-white">パスキー (Nosskey) が登録済み</p>
+                 <p className="mt-0.5 text-xs text-gray-400">
+                   ログイン画面の Nostr タブから「パスキーでログイン」で再生できます。
+                 </p>
+               </div>
+               <button
+                 onClick={onNostrPasskeyRemove}
+                 className="rounded-xl border border-orange-400/40 px-4 py-2 text-sm text-orange-300 transition-colors hover:bg-orange-400/10"
+               >
+                 削除
+               </button>
+             </div>
+           ) : (
+             <p className="text-sm text-gray-400">
+               nsec でログインしていません。ログイン画面の Nostr (nsec) タブからログインできます。
+             </p>
+           )}
         </div>
       </LiquidGlass>
     </div>
@@ -5268,6 +6018,9 @@ function UserProfileView({
   onQuote,
   onReply,
   onDelete,
+  mutedPubkeys,
+  onToggleMute,
+  mentionLookup,
 }: {
   pubkeyHex: string;
   profileMap: Record<string, FodprEvent>;
@@ -5288,6 +6041,9 @@ function UserProfileView({
   onQuote: (targetKey: string) => void;
   onReply: (targetKey: string) => void;
   onDelete: (targetKey: string, targetEvent: FodprEvent) => void;
+  mutedPubkeys: Set<string>;
+  onToggleMute: (pubkeyHex: string) => void;
+  mentionLookup: Map<string, MentionUser>;
 }) {
   const prof = profileMap[pubkeyHex];
   const p = prof ? parseProfile(prof.content) : {};
@@ -5309,10 +6065,23 @@ function UserProfileView({
             ← タイムラインに戻る
           </button>
 
-          <div className="flex items-center gap-4">
+          <div className="flex items-start gap-4">
             <Avatar picture={p.picture ?? null} pubkeyHex={pubkeyHex} name={name} className="h-20 w-20 text-2xl" />
-            <div className="min-w-0">
-              <h2 className="truncate text-lg font-semibold text-white">{name}</h2>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-start justify-between gap-2">
+                <h2 className="truncate text-lg font-semibold text-white">{name}</h2>
+                <button
+                  onClick={() => onToggleMute(pubkeyHex)}
+                  className={
+                    'shrink-0 rounded-full border px-3 py-1.5 text-xs transition-colors ' +
+                    (mutedPubkeys.has(pubkeyHex)
+                      ? 'border-primary/60 bg-primary/10 text-primary'
+                      : 'border-white/15 text-gray-300 hover:bg-white/10')
+                  }
+                >
+                  {mutedPubkeys.has(pubkeyHex) ? 'ミュート解除' : 'ミュート'}
+                </button>
+              </div>
               {p.about && <p className="mt-1 whitespace-pre-wrap break-words text-sm text-gray-400">{p.about}</p>}
             </div>
           </div>
@@ -5348,6 +6117,7 @@ function UserProfileView({
             onQuote={onQuote}
             onReply={onReply}
             onDelete={onDelete}
+            mentionLookup={mentionLookup}
           />
         ))
       )}
@@ -5597,6 +6367,53 @@ function ProfileView({
 }
 
 /* ────────────────────────────────────────────────────────────────────
+   ミュート一覧(設定画面用の共通カード)。名前解決は profileMap から行う
+   ──────────────────────────────────────────────────────────────────── */
+function MuteListCard({
+  mutedPubkeys,
+  onToggleMute,
+  displayNames,
+  title = 'ミュート中',
+}: {
+  mutedPubkeys: Set<string>;
+  onToggleMute: (pubkeyHex: string) => void;
+  displayNames: Record<string, string>;
+  title?: string;
+}) {
+  if (mutedPubkeys.size === 0) return null;
+  const keys = Array.from(mutedPubkeys).sort();
+  return (
+    <LiquidGlass intensity="subtle" refractive={false} className="liquid-glass--card w-full">
+      <div className="space-y-3 p-4">
+        <p className="text-sm font-medium text-white">
+          {title} ({keys.length})
+        </p>
+        <p className="text-xs leading-relaxed text-gray-500">
+          ミュート中のユーザーの投稿・返信・通知は表示されません。解除はボタンから、またはそのユーザーの画面から行えます。
+        </p>
+        <div className="space-y-1.5">
+          {keys.map((pk) => {
+            const name = displayNames[pk] ?? pk.slice(0, 12);
+            return (
+              <div key={pk} className="flex items-center gap-2 rounded-xl bg-black/30 px-3 py-2">
+                <span className="min-w-0 flex-1 truncate text-xs text-gray-300">{name}</span>
+                <span className="shrink-0 font-mono text-[10px] text-gray-500">{pk.slice(0, 8)}…</span>
+                <button
+                  onClick={() => onToggleMute(pk)}
+                  className="shrink-0 rounded-lg border border-white/15 px-2 py-1 text-xs text-gray-400 transition-colors hover:bg-white/10"
+                >
+                  ミュート解除
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </LiquidGlass>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────────────
    設定
    ──────────────────────────────────────────────────────────────────── */
 function SettingsView({
@@ -5607,12 +6424,13 @@ function SettingsView({
   onLogout,
   onShowDocs,
    secretHex,
-  theme,
-  onThemeChange,
   browserNotifEnabled,
   notifPermission,
   onToggleBrowserNotif,
   onRequestNotifPermission,
+  mutedPubkeys,
+  onToggleMute,
+  profileMap,
 }: {
   relayUrls: string[];
   onRelayChange: (urls: string[]) => void;
@@ -5621,12 +6439,13 @@ function SettingsView({
   onLogout: () => void;
   onShowDocs: () => void;
    secretHex: string | null;
-  theme: ThemeId;
-  onThemeChange: (t: ThemeId) => void;
   browserNotifEnabled: boolean;
   notifPermission: NotificationPermission;
   onToggleBrowserNotif: (next: boolean) => void;
   onRequestNotifPermission: () => void;
+  mutedPubkeys: Set<string>;
+  onToggleMute: (pubkeyHex: string) => void;
+  profileMap: Record<string, FodprEvent>;
 }) {
   const [relayInput, setRelayInput] = useState('');
   const [msg, setMsg] = useState<string | null>(null);
@@ -5684,28 +6503,6 @@ function SettingsView({
       <LiquidGlass intensity="subtle" refractive className="liquid-glass--card w-full">
         <div className="space-y-4 p-5">
           <h2 className="text-lg font-semibold text-white">設定</h2>
-
-          <div className="space-y-2">
-            <p className="text-xs text-gray-400">テーマ</p>
-            <div className="grid grid-cols-2 gap-2">
-              {THEME_OPTIONS.map((opt) => (
-                <button
-                  key={opt.id}
-                  onClick={() => onThemeChange(opt.id)}
-                  aria-pressed={theme === opt.id}
-                  className={
-                    'rounded-xl border px-3 py-2.5 text-left transition-colors ' +
-                    (theme === opt.id
-                      ? 'border-primary bg-primary/10 text-white'
-                      : 'border-white/15 bg-black/20 text-gray-300 hover:bg-white/10')
-                  }
-                >
-                  <span className="block text-sm font-semibold">{opt.label}</span>
-                  <span className="mt-0.5 block text-xs text-gray-400">{opt.desc}</span>
-                </button>
-              ))}
-            </div>
-          </div>
 
           <div className="space-y-2">
             <label className="block text-xs text-gray-400">ブラウザ通知</label>
@@ -5796,6 +6593,15 @@ function SettingsView({
         </div>
       </LiquidGlass>
 
+      {/* ミュート中のユーザー一覧 */}
+      <MuteListCard
+        mutedPubkeys={mutedPubkeys}
+        onToggleMute={onToggleMute}
+        displayNames={Object.fromEntries(
+          Object.entries(profileMap).map(([pk, ev]) => [pk, parseProfile(ev.content).name ?? pk]),
+        )}
+      />
+
       {/* 秘密鍵(マスク表示・コピー) + ログアウト。ゲスト(鍵なし)では非表示 */}
       {!!secretHex && (
         <LiquidGlass intensity="subtle" refractive={false} className="liquid-glass--card w-full">
@@ -5853,22 +6659,16 @@ function SettingsView({
   );
 }
 
-/* ────────────────────────────────────────────────────────────────────
-   背景テーマ。設定で選んだテーマに応じてオーロラ(グラデーション)または
-   ダークグラデ(IMG_2232.webp の配色をベース)を出す。写真は敷かない。
-   ──────────────────────────────────────────────────────────────────── */
-function ThemeBackground({ theme }: { theme: ThemeId }) {
-  return <div className={theme === 'modern' ? 'theme-modern' : 'aurora'} aria-hidden="true" />;
-}
-
 // カスタム絵文字ピッカー(NIP-30 の :shortcode: を挿入する)
 // 投稿欄の近くに配置し、クリックで絵文字グリッドを開く。
 function EmojiPicker({
   onPick,
   align = 'left',
+  emojis,
 }: {
   onPick: (def: CustomEmojiDef) => void;
   align?: 'left' | 'right';
+  emojis?: CustomEmojiDef[];
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
@@ -5970,8 +6770,8 @@ function EmojiPicker({
             className="fixed z-50 w-64 rounded-2xl border border-white/10 bg-[#14161a]/95 p-2 shadow-2xl backdrop-blur"
             style={pos ? { left: pos.left, top: pos.top } : undefined}
           >
-            <div className="grid grid-cols-8 gap-1">
-              {CUSTOM_EMOJI.map((e) => (
+            <div className="grid max-h-64 grid-cols-8 gap-1 overflow-y-auto">
+              {(emojis ?? allEmojis()).map((e) => (
                 <button
                   key={e.shortcode}
                   onClick={() => {
@@ -6013,23 +6813,33 @@ function insertTextAtCursor(textarea: HTMLTextAreaElement, text: string): string
    fsec(Fodpr)/nsec(Nostr) の入力欄を分けて設け、鍵なしの閲覧モードも選べる。
    ──────────────────────────────────────────────────────────────────── */
 function LoginScreen({
-  theme,
   onLogin,
   onGenerate,
   onNostrLogin,
+  onNostrNip07Login,
   onNostrGenerate,
+  onNostrPasskeyLogin,
+  onNostrPasskeyRegister,
+  passkeyRegistered,
   onGuest,
   nostrLoggedIn,
 }: {
-  theme: ThemeId;
   onLogin: (input: string) => Promise<void>;
   onGenerate: () => Promise<void>;
   onNostrLogin: (input: string) => Promise<void>;
+  onNostrNip07Login: () => Promise<void>;
   onNostrGenerate: () => Promise<void>;
+  onNostrPasskeyLogin: () => Promise<void>;
+  onNostrPasskeyRegister: () => Promise<void>;
+  passkeyRegistered: boolean;
   onGuest: () => void;
   nostrLoggedIn: boolean;
 }) {
   const [tab, setTab] = useState<'fodpr' | 'nostr'>('fodpr');
+
+  // NIP-07 / NIP-79 (Nosskey) が使えるか(ボタンの表示判定)
+  const nip07Available = typeof window !== 'undefined' && !!window.nostr && typeof window.nostr.getPublicKey === 'function';
+  const passkeyAvailable = nosskeySupported();
   const [keyInput, setKeyInput] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -6043,6 +6853,41 @@ function LoginScreen({
       } else {
         await onNostrLogin(keyInput);
       }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+
+  // NIP-07 でログインする(拡張が無ければエラーを表示)
+  async function nip07Login() {
+    setError('');
+    setBusy(true);
+    try {
+      await onNostrNip07Login();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+
+  // NIP-79 (Nosskey): パスキーでログイン/新規登録。登録済みなら再ログイン、未登録なら新規作成。
+  async function passkeyLogin() {
+    setError('');
+    setBusy(true);
+    try {
+      await onNostrPasskeyLogin();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+
+  async function passkeyRegister() {
+    setError('');
+    setBusy(true);
+    try {
+      await onNostrPasskeyRegister();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setBusy(false);
@@ -6073,8 +6918,6 @@ function LoginScreen({
 
   return (
     <div className="relative min-h-screen overflow-hidden bg-bg text-gray-100">
-      <ThemeBackground theme={theme} />
-
       <div className="relative z-10 flex min-h-screen items-center justify-center px-4">
         <LiquidGlass intensity="vision" refractive className="w-full max-w-md">
           <div className="space-y-4 p-7">
@@ -6148,10 +6991,51 @@ function LoginScreen({
                     autoFocus
                     className="w-full rounded-xl bg-black/30 px-3 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-white/25"
                   />
-                  {nostrLoggedIn && (
-                    <p className="text-xs text-green-400">このブラウザには nsec が保存されています。</p>
-                  )}
-                </>
+                   {nostrLoggedIn && (
+                     <p className="text-xs text-green-400">このブラウザには nsec が保存されています。</p>
+                   )}
+                   <button
+                     onClick={() => void nip07Login()}
+                     disabled={busy}
+                     className="mt-2 w-full rounded-xl border border-primary/40 bg-primary/5 py-2 text-xs text-primary transition-colors hover:bg-primary/10 disabled:opacity-50"
+                   >
+                     {nip07Available
+                       ? 'ブラウザ拡張 (NIP-07) でログイン'
+                        : 'ブラウザ拡 (NIP-07) でログイン — 拡張がありません'}
+                   </button>
+
+                   {/* NIP-79 (Nosskey / PRF) パスキーでログイン/新規登録 */}
+                   <div className="mt-2 space-y-2">
+                     {passkeyRegistered ? (
+                       <p className="text-xs text-green-400">パスキー (Nosskey)が登録されています。</p>
+                     ) : (
+                       <p className="text-xs text-gray-400">
+                         パスキー (Nosskey) : WebAuthn PRF で Nostr 鍵を派生。秘密鍵は永続化されません。
+                       </p>
+                     )}
+                     {passkeyRegistered ? (
+                       <button
+                         onClick={() => void passkeyLogin()}
+                         disabled={busy}
+                         className="w-full rounded-xl border border-emerald/40 bg-emerald/5 py-2 text-xs text-emerald transition-colors hover:bg-emerald/10 disabled:opacity-50"
+                       >
+                         {busy ? '処理中...' : 'パスキー (Nosskey) でログイン'}
+                       </button>
+                     ) : (
+                       <button
+                         onClick={() => void passkeyRegister()}
+                         disabled={busy || !passkeyAvailable}
+                         className="w-full rounded-xl border border-emerald/40 bg-emerald/5 py-2 text-xs text-emerald transition-colors hover:bg-emerald/10 disabled:opacity-50"
+                       >
+                         {!passkeyAvailable
+                           ? 'パスキー (Nosskey) で新規登録 — 使えません'
+                           : busy
+                             ? '処理中...'
+                             : 'パスキー (Nosskey) で新規登録'}
+                       </button>
+                     )}
+                   </div>
+                 </>
               )}
             </div>
 

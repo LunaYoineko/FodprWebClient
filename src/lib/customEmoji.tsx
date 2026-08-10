@@ -47,6 +47,63 @@ const PACK_BY_CODE: Record<string, CustomEmojiDef> = Object.fromEntries(
   CUSTOM_EMOJI.map((e) => [e.shortcode, e]),
 );
 
+// ── 外部(emoemo / NIP-30 パック)絵文字のランタイム登録 ──────────────
+// ビルトインパックに加えて、Nostr の kind 10030(マイ絵文字リスト)や
+// kind 30030(絵文字パック)から取得した絵文字を shortcode で解決できるようにする。
+// 登録順(ビルトイン → emoemo)で後勝ちにすることで、パック側のカスタム絵文字を優先する。
+const EXTERNAL_BY_CODE = new Map<string, CustomEmojiDef>();
+
+export function registerExternalEmoji(def: CustomEmojiDef): void {
+  EXTERNAL_BY_CODE.set(def.shortcode, def);
+}
+
+export function clearExternalEmojis(): void {
+  EXTERNAL_BY_CODE.clear();
+}
+
+export function isExternalEmoji(code: string): boolean {
+  return EXTERNAL_BY_CODE.has(code);
+}
+
+// shortcode → 定義(ビルトイン + 外部)を解決する
+export function resolveEmojiDef(code: string): CustomEmojiDef | undefined {
+  return EXTERNAL_BY_CODE.get(code) ?? PACK_BY_CODE[code];
+}
+
+// ピッカー用の一覧(ビルトイン + 外部、shortcode の重複は外部を優先)
+export function allEmojis(): CustomEmojiDef[] {
+  const seen = new Set<string>();
+  const out: CustomEmojiDef[] = [];
+  for (const e of CUSTOM_EMOJI) {
+    seen.add(e.shortcode);
+    out.push(e);
+  }
+  for (const e of EXTERNAL_BY_CODE.values()) {
+    if (!seen.has(e.shortcode)) {
+      seen.add(e.shortcode);
+      out.push(e);
+    }
+  }
+  return out;
+}
+
+// Nostr の kind 10030(マイ絵文字リスト) / kind 30030(絵文字パック)から
+// 絵文字定義を抽出する。パックには d タグの識別子を label として付与する。
+export function parseEmoemoEvents(events: { kind: number; tags: NostrTags }[]): CustomEmojiDef[] {
+  const out: CustomEmojiDef[] = [];
+  for (const e of events) {
+    if (e.kind !== 10030 && e.kind !== 30030) continue;
+    const ident = e.tags.find((t) => t[0] === 'd' && typeof t[1] === 'string' && t[1])?.[1] ?? '';
+    const packName = ident || (e.kind === 30030 ? 'emoemo' : 'マイ絵文字');
+    for (const t of e.tags) {
+      if (t[0] === 'emoji' && typeof t[1] === 'string' && t[1] && typeof t[2] === 'string' && t[2]) {
+        out.push({ shortcode: t[1], path: t[2], label: `${packName}: ${t[1]}` });
+      }
+    }
+  }
+  return out;
+}
+
 export function isValidShortcode(code: string): boolean {
   return SHORTCODE_RE.test(code);
 }
@@ -76,10 +133,10 @@ export function extractEmojiShortcodes(content: string): string[] {
   return seen;
 }
 
-// ビルトインパックに定義済みの shortcode だけを対象にする
+// ビルトインパック + emoemo 登録済みの shortcode を対象にする
 function usedPackEmojis(content: string): CustomEmojiDef[] {
   return extractEmojiShortcodes(content)
-    .map((code) => PACK_BY_CODE[code])
+    .map((code) => resolveEmojiDef(code))
     .filter((e): e is CustomEmojiDef => !!e);
 }
 
@@ -159,13 +216,17 @@ export function renderCustomEmojis(content: string, emojiMap: Record<string, str
 // 裸 NIP-19 bech32 トークン(npub/note/nprofile/nevent/naddr + データ)
 const BARE_BCH_RE = /(npub1|note1|nprofile1|nevent1|naddr1)[0-9a-z]{6,}/;
 
-// content の `:shortcode:` / `nostr:<uri>` / 裸 bech32 トークンを走査し
-// React 要素列へ変換する。emojiMap は :shortcode: の解決用。
+// content の `:shortcode:` / `nostr:<uri>` / 裸 bech32 トークン / `@名前` メンションを
+// 走査し React 要素列へ変換する。emojiMap は :shortcode: の解決用。
 // noteById が与えられた場合、note 参照先がキャッシュ済みならインラインプレビューを埋め込む。
+// mentionLookup / onOpenUser が与えられた場合、@名前/@hex/@npub メンションを
+// プロフィールを開くボタンとして描画する。
 export function renderNostrContent(
   content: string,
   emojiMap: Record<string, string>,
   noteById: Record<string, NostrEvent> | null = null,
+  mentionLookup: Map<string, { pk: string; name: string }> | null = null,
+  onOpenUser: ((pk: string) => void) | null = null,
 ): ReactNode[] {
   const TOKEN_RE = new RegExp(
     '(' +
@@ -176,7 +237,11 @@ export function renderNostrContent(
       '(?:npub|note|nprofile|nevent|naddr)1[0-9a-z]+' +
       '|' +
       // shortcode
-      ':[A-Za-z0-9_-]+:)',
+      ':[A-Za-z0-9_-]+:' +
+      '|' +
+      // @メンション
+      '@[^\\s@,。、!！?？;；]+' +
+      ')',
     'gi',
   );
 
@@ -224,6 +289,24 @@ export function renderNostrContent(
     if (bare) {
       out.push(...renderEntity(safeDecode(bare[0]), bare[0], noteById, seq));
       continue;
+    }
+
+    const mention = /^@(.+)$/.exec(part);
+    if (mention) {
+      const u = mentionLookup?.get(mention[1]);
+      if (u && onOpenUser) {
+        out.push(
+          <button
+            key={`m${seq}`}
+            onClick={() => onOpenUser(u.pk)}
+            className="text-primary transition-colors hover:text-primary-hover hover:underline"
+            title="プロフィールを開く"
+          >
+            @{u.name}
+          </button>,
+        );
+        continue;
+      }
     }
 
     out.push(<SteganographyText key={`t${seq}`} content={part} />);

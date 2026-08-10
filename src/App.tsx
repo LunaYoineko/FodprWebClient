@@ -3036,7 +3036,15 @@ function App() {
   // 復号ロード中はローディング画面
   if (!ready) {
     return (
-      <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-bg text-gray-400">
+      <div className="relative flex min-h-screen items-center justify-center overflow-hidden text-gray-400">
+        <div
+          className="absolute inset-0 -z-10"
+          style={{
+            background:
+              'radial-gradient(60rem 60rem at 20% -10%, rgb(77 160 255 / 0.22), transparent 60%), radial-gradient(50rem 50rem at 110% 20%, rgb(120 96 255 / 0.18), transparent 60%), #0e1012',
+          }}
+          aria-hidden="true"
+        />
         <p className="relative z-10 text-sm">読み込み中...</p>
       </div>
     );
@@ -3107,7 +3115,15 @@ function App() {
         : NOSTR_NAV_ITEMS.filter((i) => i.id !== 'profile');
 
   return (
-    <div className="relative h-svh h-[100dvh] overflow-hidden bg-bg text-gray-100">
+    <div className="relative h-svh h-[100dvh] overflow-hidden text-gray-100">
+      <div
+        className="absolute inset-0 -z-10"
+        style={{
+          background:
+            'radial-gradient(60rem 60rem at 20% -10%, rgb(77 160 255 / 0.22), transparent 60%), radial-gradient(50rem 50rem at 110% 20%, rgb(120 96 255 / 0.18), transparent 60%), #0e1012',
+        }}
+        aria-hidden="true"
+      />
       <div className="relative z-10 flex h-full flex-col pt-[env(safe-area-inset-top)]">
         {/* ヘッダー */}
         <header className="flex flex-wrap items-center justify-center gap-2 px-3 py-2.5 sm:gap-3 sm:px-4 sm:py-3">
@@ -6917,7 +6933,15 @@ function LoginScreen({
   }
 
   return (
-    <div className="relative min-h-screen overflow-hidden bg-bg text-gray-100">
+    <div className="relative min-h-screen overflow-hidden text-gray-100">
+      <div
+        className="absolute inset-0 -z-10"
+        style={{
+          background:
+            'radial-gradient(60rem 60rem at 20% -10%, rgb(77 160 255 / 0.22), transparent 60%), radial-gradient(50rem 50rem at 110% 20%, rgb(120 96 255 / 0.18), transparent 60%), #0e1012',
+        }}
+        aria-hidden="true"
+      />
       <div className="relative z-10 flex min-h-screen items-center justify-center px-4">
         <LiquidGlass intensity="vision" refractive className="w-full max-w-md">
           <div className="space-y-4 p-7">

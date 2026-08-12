@@ -11,6 +11,9 @@ importers:
       '@dpawlikowski/liquid-glass':
         specifier: ^0.3.0
         version: 0.3.0(react@19.2.8)
+      nosskey-sdk:
+        specifier: ^0.2.0
+        version: 0.2.0
       react:
         specifier: ^19.2.8
         version: 19.2.8
@@ -27,6 +30,9 @@ importers:
       '@noble/secp256k1':
         specifier: ^3.1.0
         version: 3.1.0
+      '@types/node':
+        specifier: ^26.2.0
+        version: 26.2.0
       '@types/react':
         specifier: ^19.2.18
         version: 19.2.18
@@ -35,7 +41,7 @@ importers:
         version: 19.2.4(@types/react@19.2.18)
       '@vitejs/plugin-react':
         specifier: ^6.0.5
-        version: 6.0.5(vite@8.2.0(jiti@1.21.7))
+        version: 6.0.5(vite@8.2.0(@types/node@26.2.0)(jiti@1.21.7))
       autoprefixer:
         specifier: ^9.8.8
         version: 9.8.8
@@ -50,7 +56,7 @@ importers:
         version: 6.0.3
       vite:
         specifier: ^8.2.0
-        version: 8.2.0(jiti@1.21.7)
+        version: 8.2.0(@types/node@26.2.0)(jiti@1.21.7)
 
 packages:
 
@@ -79,8 +85,20 @@ packages:
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
 
+  '@noble/ciphers@2.3.0':
+    resolution: {integrity: sha512-Clu/xdfgVTf9o7ngLOURaxePwR0j8sjclKEtVij10/jGulwFsPWCvvRgG/XjUVf8Nei+jLG6uwyXzUTGY1DQrw==}
+    engines: {node: '>= 20.19.0'}
+
+  '@noble/curves@2.3.0':
+    resolution: {integrity: sha512-v7cY+4oWYPQszRj6ZFGzTVL7uP2TaLo1xMhWHzYC5wj0ZhOXQ5x+sBre8rF3hi8cAoi0bh1qXoovoOkdFtvqEg==}
+    engines: {node: '>= 20.19.0'}
+
   '@noble/hashes@2.2.0':
     resolution: {integrity: sha512-IYqDGiTXab6FniAgnSdZwgWbomxpy9FtYvLKs7wCUs2a8RkITG+DFGO1DM9cr+E3/RgADRpFjrKVaJ1z6sjtEg==}
+    engines: {node: '>= 20.19.0'}
+
+  '@noble/hashes@2.3.0':
+    resolution: {integrity: sha512-oN+QwyX7VSHotibwubG3kpzbwKrfnyR6OOO+3Nk/53ADL7FmgHHz4TgrbaYKvvOw09u6QTx0oiH1cNCIOuN0CQ==}
     engines: {node: '>= 20.19.0'}
 
   '@noble/secp256k1@3.1.0':
@@ -193,6 +211,23 @@ packages:
 
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
+
+  '@rx-nostr/crypto@3.1.6':
+    resolution: {integrity: sha512-9KOpSxEqYIdrV7rTXImKMnlm/moDZhDZotnhW+kezbTkreQnYQJ9FPIth/ME/gXyR37LVqgRXS2FHp67WrNiHQ==}
+    peerDependencies:
+      rx-nostr: ~3
+    peerDependenciesMeta:
+      rx-nostr:
+        optional: true
+
+  '@scure/base@2.3.0':
+    resolution: {integrity: sha512-NsG6Y03tY6R5BUis4FdVtHVkur0U6FOzskgs9ZXNl78CUc9fkZ78HmENUle1nSOkCasDmbubmWD9qwB7mm4PZA==}
+
+  '@types/node@25.9.5':
+    resolution: {integrity: sha512-OScDchr2fwuUmWdf4kZ9h7PcJiYDVInhJizG/biAq3cAvqwYktuy/TYGGdZNMtNTFUP7rnb0NU4TUdm82kt4Rg==}
+
+  '@types/node@26.2.0':
+    resolution: {integrity: sha512-5IviulTZeRNp2vAJ514cc/HUlY5nZ9fCbq9DMyC52BrhFZACo3nI0R7qBxhQmo/d27NFe96ur/b7Wwxklda+kg==}
 
   '@types/react-dom@19.2.4':
     resolution: {integrity: sha512-Bsc+QHgp+P/F02XDzNCY9jnZNCUuLki36KT7VKrTXXLdHf+vHMNZnW1rVu5DNW/rCK+fya3DATySbLM4yhtKUw==}
@@ -464,6 +499,13 @@ packages:
     resolution: {integrity: sha512-bdok/XvKII3nUpklnV6P2hxtMNrCboOjAcyBuQnWEhO665FwrSNRxU+AqpsyvO6LgGYPspN+lu5CLtw4jPRKNA==}
     engines: {node: '>=0.10.0'}
 
+  nosskey-sdk@0.2.0:
+    resolution: {integrity: sha512-Fx9bIHjkgz6FQNqQ0kQTNaPh+e/KtTENcMmWgDtn14XXFOWMSGIbKPoN6UeLnsmDnXhSYCqEnd72UxdIoncPWg==}
+    engines: {node: '>=22'}
+
+  nostr-typedef@0.13.0:
+    resolution: {integrity: sha512-CwEC8m83FYKip4ED0nkQa+/tJQpJAKwzc7JgPsunuv26ZpwYqNfc+KvEaKCyM/q5IuKzWuSzsLFtXDfTIm2lkQ==}
+
   num2fraction@1.2.2:
     resolution: {integrity: sha512-Y1wZESM7VUThYY+4W+X4ySH2maqcA+p7UR+w8VWNWVAd6lwuXXWz/w/Cz43J/dI2I+PS6wD5N+bJUF+gjWvIqg==}
 
@@ -587,6 +629,12 @@ packages:
   run-parallel@1.2.0:
     resolution: {integrity: sha512-5l4VyZR86LZ/lDxZTR6jqL8AFE2S0IFLMP26AbjsLVADxHdhB/c0GUsH+y39UfCi3dzz8OlQuPmnaJOMoDHQBA==}
 
+  rx-nostr@3.7.5:
+    resolution: {integrity: sha512-hmgLIVo22Q5FHfDoWugfr6SyuyeoFgrMT8bjv8LU6jE5NndwvYeZ5SfQOgLZ1p5t19PSU3PQHJBv5dhCcS8bBA==}
+
+  rxjs@7.8.2:
+    resolution: {integrity: sha512-dhKf903U/PQZY6boNNtAGdWbG85WAbjT/1xYoZIC7FAY0yWapOBQVsVrDl58W86//e1VpMNBtRV4MaXfdMySFA==}
+
   scheduler@0.27.0:
     resolution: {integrity: sha512-eNv+WrVbKu1f3vbYJT/xtiF5syA5HPIMtf9IgY/nKg0sWqzAUEvqY/xm7OcZc/qafLx/iO9FgOmeSAp4v5ti/Q==}
 
@@ -630,10 +678,19 @@ packages:
   ts-interface-checker@0.1.13:
     resolution: {integrity: sha512-Y/arvbn+rrz3JCKl9C4kVNfTfSm2/mEp5FSz5EsZSANGPSlQrpRI5M4PKF+mJnE52jOO90PnPSc3Ur3bTQw0gA==}
 
+  tslib@2.8.1:
+    resolution: {integrity: sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==}
+
   typescript@6.0.3:
     resolution: {integrity: sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==}
     engines: {node: '>=14.17'}
     hasBin: true
+
+  undici-types@7.24.6:
+    resolution: {integrity: sha512-WRNW+sJgj5OBN4/0JpHFqtqzhpbnV0GuB+OozA9gCL7a993SmU+1JBZCzLNxYsbMfIeDL+lTsphD5jN5N+n0zg==}
+
+  undici-types@8.3.0:
+    resolution: {integrity: sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ==}
 
   update-browserslist-db@1.2.3:
     resolution: {integrity: sha512-Js0m9cx+qOgDxo0eMiFGEueWztz+d4+M3rGlmKPT+T4IS/jP4ylw3Nwpu6cpTTP8R1MAC1kF4VbdLt3ARf209w==}
@@ -721,7 +778,15 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
+  '@noble/ciphers@2.3.0': {}
+
+  '@noble/curves@2.3.0':
+    dependencies:
+      '@noble/hashes': 2.3.0
+
   '@noble/hashes@2.2.0': {}
+
+  '@noble/hashes@2.3.0': {}
 
   '@noble/secp256k1@3.1.0': {}
 
@@ -783,6 +848,26 @@ snapshots:
 
   '@rolldown/pluginutils@1.0.1': {}
 
+  '@rx-nostr/crypto@3.1.6(rx-nostr@3.7.5)':
+    dependencies:
+      '@noble/curves': 2.3.0
+      '@noble/hashes': 2.2.0
+      '@scure/base': 2.3.0
+      '@types/node': 25.9.5
+      nostr-typedef: 0.13.0
+    optionalDependencies:
+      rx-nostr: 3.7.5
+
+  '@scure/base@2.3.0': {}
+
+  '@types/node@25.9.5':
+    dependencies:
+      undici-types: 7.24.6
+
+  '@types/node@26.2.0':
+    dependencies:
+      undici-types: 8.3.0
+
   '@types/react-dom@19.2.4(@types/react@19.2.18)':
     dependencies:
       '@types/react': 19.2.18
@@ -791,10 +876,10 @@ snapshots:
     dependencies:
       csstype: 3.2.3
 
-  '@vitejs/plugin-react@6.0.5(vite@8.2.0(jiti@1.21.7))':
+  '@vitejs/plugin-react@6.0.5(vite@8.2.0(@types/node@26.2.0)(jiti@1.21.7))':
     dependencies:
       '@rolldown/pluginutils': 1.0.1
-      vite: 8.2.0(jiti@1.21.7)
+      vite: 8.2.0(@types/node@26.2.0)(jiti@1.21.7)
 
   any-promise@1.3.0: {}
 
@@ -994,6 +1079,16 @@ snapshots:
 
   normalize-range@0.1.2: {}
 
+  nosskey-sdk@0.2.0:
+    dependencies:
+      '@noble/ciphers': 2.3.0
+      '@noble/curves': 2.3.0
+      '@noble/hashes': 2.2.0
+      '@rx-nostr/crypto': 3.1.6(rx-nostr@3.7.5)
+      rx-nostr: 3.7.5
+
+  nostr-typedef@0.13.0: {}
+
   num2fraction@1.2.2: {}
 
   object-assign@4.1.1: {}
@@ -1106,6 +1201,16 @@ snapshots:
     dependencies:
       queue-microtask: 1.2.3
 
+  rx-nostr@3.7.5:
+    dependencies:
+      '@types/node': 25.9.5
+      nostr-typedef: 0.13.0
+      rxjs: 7.8.2
+
+  rxjs@7.8.2:
+    dependencies:
+      tslib: 2.8.1
+
   scheduler@0.27.0: {}
 
   source-map-js@1.2.1: {}
@@ -1171,7 +1276,13 @@ snapshots:
 
   ts-interface-checker@0.1.13: {}
 
+  tslib@2.8.1: {}
+
   typescript@6.0.3: {}
+
+  undici-types@7.24.6: {}
+
+  undici-types@8.3.0: {}
 
   update-browserslist-db@1.2.3(browserslist@4.28.7):
     dependencies:
@@ -1181,7 +1292,7 @@ snapshots:
 
   util-deprecate@1.0.2: {}
 
-  vite@8.2.0(jiti@1.21.7):
+  vite@8.2.0(@types/node@26.2.0)(jiti@1.21.7):
     dependencies:
       lightningcss: 1.33.0
       picomatch: 4.0.5
@@ -1189,6 +1300,7 @@ snapshots:
       rolldown: 1.2.2
       tinyglobby: 0.2.17
     optionalDependencies:
+      '@types/node': 26.2.0
       fsevents: 2.3.3
       jiti: 1.21.7
 

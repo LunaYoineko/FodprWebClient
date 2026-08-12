@@ -90,6 +90,13 @@ function parseFodprTag(tags: string[], prefix: string): string | undefined {
   return undefined;
 }
 
+// FodprEvent.content は SDK で Uint8Array になった。文字列として読むときはデコードする。
+const eventContentDecoder = new TextDecoder();
+function eventContentStr(e: FodprEvent): string {
+  const c = e.content as unknown;
+  return typeof c === 'string' ? (c as string) : eventContentDecoder.decode(e.content);
+}
+
 export function normalizeFodprEvent(e: FodprEvent): UnifiedEvent {
   const pk = CryptoUtils.bytesToHex(e.pubkey);
   const sig = CryptoUtils.bytesToHex(e.signature);
@@ -119,7 +126,7 @@ export function normalizeFodprEvent(e: FodprEvent): UnifiedEvent {
   let kind: UnifiedKind;
   if (e.transType === TransTypeJSON) {
     try {
-      const obj = JSON.parse(e.content);
+      const obj = JSON.parse(eventContentStr(e));
       if (obj?.mode === 'profile') kind = 'profile';
       else kind = 'other';
     } catch {
@@ -141,7 +148,7 @@ export function normalizeFodprEvent(e: FodprEvent): UnifiedEvent {
   let profileContent: string | undefined;
   if (kind === 'profile') {
     try {
-      const obj = JSON.parse(e.content);
+      const obj = JSON.parse(eventContentStr(e));
       profileContent = JSON.stringify({
         name: obj.name,
         about: obj.about,
@@ -155,7 +162,7 @@ export function normalizeFodprEvent(e: FodprEvent): UnifiedEvent {
   return {
     ...base,
     kind,
-    content: profileContent ?? e.content,
+    content: profileContent ?? eventContentStr(e),
     tags,
   };
 }

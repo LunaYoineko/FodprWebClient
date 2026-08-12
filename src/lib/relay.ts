@@ -15,9 +15,16 @@ import {
   Protocol,
   MsgTypePush,
   MsgTypeEvent,
+  MsgTypeSignalPush,
+  MsgTypeDataPush,
+  MsgTypeChallenge,
   type FodprEvent,
   type FodprReq,
   type FodprDelReq,
+  type FodprSignal,
+  type FodprData,
+  type F2FSignal,
+  type FodprAuth,
 } from '@fodpr/protocol';
 
 // url を含まないメッセージ本文
@@ -26,7 +33,11 @@ type RelayMessageBody =
   | { kind: 'closed'; code: number } // 切断
   | { kind: 'error'; message: string } // エラー
   | { kind: 'text'; text: string } // サーバーからのテキスト応答("OK: ..."(ERR:.../EOE:...)
-  | { kind: 'event'; subId: string; event: FodprEvent }; // PUSH されたイベント
+  | { kind: 'event'; subId: string; event: FodprEvent } // PUSH されたイベント
+  | { kind: 'signal'; subId: string; signal: FodprSignal } // Signal PUSH (WebRTC シグナリング)
+  | { kind: 'f2fSignal'; subId: string; f2fSignal: F2FSignal } // F2F Signal PUSH (viaRelay)
+  | { kind: 'data'; subId: string; dataMsg: FodprData } // Data PUSH (F2F データチャネルリレー)
+  | { kind: 'challenge'; nonce: Uint8Array }; // 認証チャレンジ (0x82)
 
 // クライアントが受け取れるメッセージの種類(送信元リレー url 付き)
 export type RelayMessage = RelayMessageBody & { url: string };
@@ -118,6 +129,32 @@ export class RelayClient {
       const subId = new TextDecoder().decode(bytes.subarray(3, 3 + subIdLen));
       const event = Protocol.decodeEvent(bytes.subarray(3 + subIdLen));
       this.emit({ kind: 'event', subId, event });
+    } else if (bytes[0] === MsgTypeSignalPush) {
+      // SIGNAL_PUSH(0x83): WebRTC / F2F シグナリング配信
+      // レイアウト: [MsgTypeSignalPush(1)] [SubIdLen(2)] [SubId] [encodedSignal or encodedF2FSignal]
+      try {
+        const { subId, signal, f2fSignal } = Protocol.decodeSignalPushAny(bytes);
+        if (f2fSignal) {
+          this.emit({ kind: 'f2fSignal', subId, f2fSignal });
+        } else if (signal) {
+          this.emit({ kind: 'signal', subId, signal });
+        }
+      } catch {
+        /* シグナリングパース失敗は無視 */
+      }
+    } else if (bytes[0] === MsgTypeDataPush) {
+      // DATA_PUSH(0x84): F2F データチャネルリレー経由のデータ配信
+      try {
+        const { subId, dataMsg } = Protocol.decodeDataPush(bytes);
+        this.emit({ kind: 'data', subId, dataMsg });
+      } catch {
+        /* データパース失敗は無視 */
+      }
+    } else if (bytes[0] === MsgTypeChallenge) {
+      // CHALLENGE(0x82): 認証チャレンジ
+      // レイアウト: [MsgTypeChallenge(1)] [nonce(32)]
+      const nonce = bytes.slice(1, 33);
+      this.emit({ kind: 'challenge', nonce });
     } else {
       // 予期せずテキストでない場合は UTF-8 として表示
       this.emit({ kind: 'text', text: new TextDecoder().decode(bytes) });
@@ -147,6 +184,59 @@ export class RelayClient {
     this.ensureOpen();
     const payload = Protocol.encodeDel(req);
     this.ws!.send(this.toArrayBuffer(payload));
+  }
+
+  // 認証応答(AUTH)を送信。encodeAuth は先頭に種別バイト(0x04)を含む。
+  sendAuth(auth: FodprAuth) {
+    this.ensureOpen();
+    const payload = Protocol.encodeAuth(auth);
+    this.ws!.send(this.toArrayBuffer(payload));
+  }
+
+  // --- F2F: シグナリング/Sデータ送信 (リレー経由フォールバック) ---
+
+  // FodprSignal (TransTypeWebRTC) をシグナリングメッセージとして送信。
+  sendSignal(signal: FodprSignal) {
+    this.ensureOpen();
+    const payload = Protocol.encodeSignal(signal);
+    const frame = new Uint8Array(1 + payload.length);
+    frame[0] = 5; // MsgTypeSignal (0x05)
+    frame.set(payload, 1);
+    this.ws!.send(this.toArrayBuffer(frame));
+  }
+
+  // F2FSignal (viaRelay=true) をシグナリングメッセージとして送信。
+  // リレー経由で F2FSignal を中継する場合に使用する。
+  sendF2FSignal(signal: F2FSignal) {
+    this.ensureOpen();
+    const payload = Protocol.encodeF2FSignal(signal);
+    const frame = new Uint8Array(1 + payload.length);
+    frame[0] = 5; // MsgTypeSignal (0x05)
+    frame.set(payload, 1);
+    this.ws!.send(this.toArrayBuffer(frame));
+  }
+
+  // FodprData (TransTypeData) をデータメッセージとして送信。
+  sendData(data: FodprData) {
+    this.ensureOpen();
+    const payload = Protocol.encodeData(data);
+    const frame = new Uint8Array(1 + payload.length);
+    frame[0] = 6; // MsgTypeData (0x06)
+    frame.set(payload, 1);
+    this.ws!.send(this.toArrayBuffer(frame));
+  }
+
+  // シードリクエスト (Text フレーム JSON) を送信
+  sendSeedRequest(maxNodes: number = 50) {
+    this.ensureOpen();
+    const req = Protocol.encodeSeedRequest(maxNodes);
+    this.ws!.send(req);
+  }
+
+  // プレーンテキスト (JSON 等) を送信
+  sendText(text: string) {
+    this.ensureOpen();
+    this.ws!.send(text);
   }
 
   // 接続が必要なメソッド共通の事前チェック

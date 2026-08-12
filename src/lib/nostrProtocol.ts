@@ -531,6 +531,7 @@ export function buildQuoteTags(targetId: string, targetPubkey: string): NostrTag
   return [
     ['e', targetId, '', 'q'],
     ...(targetPubkey ? [['p', targetPubkey]] : []),
+    ['client', 'Prrr'],
   ];
 }
 
@@ -539,6 +540,7 @@ export function buildReactionTags(targetId: string, targetPubkey: string): Nostr
   return [
     ['e', targetId, '', 'react'],
     ['p', targetPubkey],
+    ['client', 'Prrr'],
   ];
 }
 

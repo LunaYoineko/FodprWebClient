@@ -48,6 +48,9 @@ import {
   loginNosskeyPasskey,
   nosskeySupported,
   registerNosskeyPasskey,
+  saveNsecToNosskey,
+  hasNosskeyCredential,
+  getStoredNosskeyCred,
 } from './lib/nosskey';
 import { fetchNostrKind0, fetchNostrRelayList, type RelayList } from './lib/nostrRelay';
 import { useNostrRelay, type NostrRelayStatus } from './hooks/useNostrRelay';
@@ -65,6 +68,8 @@ import {
   type CustomEmojiDef,
 } from './lib/customEmoji';
 import { SteganographyText } from './lib/steganography';
+import { type F2FGroupInfo, type F2FPeerInfo } from './lib/fodprF2f';
+import { createNetworkManager, type NetworkManager, type NetworkMode, type RtcGroupInfo } from './lib/network';
 
 // 既定の接続先リレー(設定画面から追加・削除可能)
 const DEFAULT_RELAYS = [
@@ -72,6 +77,7 @@ const DEFAULT_RELAYS = [
   'wss://fodpr-subrelay.yoinekodo.jp/'
 ];
 const RELAYS_STORAGE_KEY = 'fodpr_relays';
+const NETWORK_MODE_STORAGE_KEY = 'fodpr_network_mode';
 
 // 既定の Nostr リレー(設定画面から追加・削除可能)
 const DEFAULT_NOSTR_RELAYS = ['wss://relay.yoinekodo.jp/'];
@@ -284,11 +290,6 @@ function inlineImageUrls(content: string): string[] {
   return [...content.matchAll(IMG_URL_RE)].map((m) => m[0]);
 }
 
-// 文字列の SHA-256 ハッシュ(32 バイト)を計算する
-function computeSHA256(data: string): Uint8Array {
-  return new Uint8Array(sha256(new TextEncoder().encode(data)));
-}
-
 // リレー一覧を localStorage から読み込む(不正な値は既定値へフォールバック)
 function loadRelays(): string[] {
   const raw = localStorage.getItem(RELAYS_STORAGE_KEY);
@@ -327,7 +328,7 @@ function splitEvents(events: FodprEvent[]) {
   for (const e of events) {
     if (e.transType === TransTypeJSON) {
       try {
-        const obj = JSON.parse(e.content);
+            const obj = JSON.parse(eventContentStr(e));
         if (obj?.mode === 'profile') {
           out.profiles.push(e);
           continue;
@@ -372,6 +373,14 @@ function latestProfilePerPubkey(profiles: FodprEvent[]): Record<string, FodprEve
 }
 
 // プロフィールイベントの content をパースする(失敗時は空オブジェクト)
+// SDK で FodprEvent.content が Uint8Array になったため、文字列として読むときは
+// eventContentStr でデコードする(旧データ/ローカル楽観イベントは既に string の場合もある)。
+const eventContentDecoder = new TextDecoder();
+function eventContentStr(e: FodprEvent): string {
+  const c = e.content as unknown;
+  return typeof c === 'string' ? (c as string) : eventContentDecoder.decode(e.content);
+}
+
 function parseProfile(content: string): { name?: string; about?: string; picture?: string } {
   try {
     const obj = JSON.parse(content);
@@ -391,13 +400,13 @@ function parseProfile(content: string): { name?: string; about?: string; picture
 // プロフィールイベントから名前を取り出す(失敗時は null)
 function profileName(e: FodprEvent | undefined): string | null {
   if (!e) return null;
-  return parseProfile(e.content).name ?? null;
+  return parseProfile(eventContentStr(e)).name ?? null;
 }
 
 // プロフィールイベントからアイコン画像 URL(直リンク)を取り出す(失敗時は null)
 function profilePicture(e: FodprEvent | undefined): string | null {
   if (!e) return null;
-  return parseProfile(e.content).picture ?? null;
+  return parseProfile(eventContentStr(e)).picture ?? null;
 }
 
 // メディア投稿(Binary)の content 形式: <mime>:<base64>
@@ -610,11 +619,11 @@ function replyParentName(
 function eventSnippet(e: FodprEvent | undefined): string {
   if (!e) return '';
   if (e.transType === TransTypeBinary) {
-    const media = parseImageContent(e.content);
+    const media = parseImageContent(eventContentStr(e));
     if (media) return media.mime.startsWith('video/') ? '動画' : '画像';
     return '[バイナリ]';
   }
-  const s = e.content.trim();
+  const s = eventContentStr(e).trim();
   return s.length > 80 ? s.slice(0, 80) + '…' : s;
 }
 
@@ -875,7 +884,7 @@ function NotificationsView({
                   // リアクションイベント自体を探す
                   const reactEvents = links.filter((e) => {
                     const rt = reactionTarget(e);
-                    return rt === n.targetKey && CryptoUtils.bytesToHex(e.pubkey) === senderPubkeyHex && e.content === reacted.emoji;
+                    return rt === n.targetKey && CryptoUtils.bytesToHex(e.pubkey) === senderPubkeyHex && eventContentStr(e) === reacted.emoji;
                   });
                   interactionEvent = reactEvents[0] ?? null;
                 }
@@ -1099,11 +1108,11 @@ function NotifPostViewer({
           {source === 'fodpr' && (
             <>
               <p className="whitespace-pre-wrap break-words text-gray-100">
-                {renderCustomEmojis((post as FodprEvent).content, parseFodprEmojiTags((post as FodprEvent).tags))}
+                {renderCustomEmojis(eventContentStr(post as FodprEvent), parseFodprEmojiTags((post as FodprEvent).tags))}
               </p>
               {(post as FodprEvent).transType === TransTypeBinary &&
                 (() => {
-                  const media = parseImageContent((post as FodprEvent).content);
+                  const media = parseImageContent(eventContentStr(post as FodprEvent));
                   if (!media) return null;
                   return (
                     <img
@@ -1483,7 +1492,130 @@ function App() {
 
    // ブラウザ通知の基準時刻。ページを開いた瞬間以降に作成された通知だけを
    // OS 通知として飛ばし、起動時一括取得で届く過去の通知は飛ばさない。
-   const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
+const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
+
+    // ────────────────────────────────────────────────────────────────────────
+    // 統合ネットワーク層 (F2F / Relay / RtcGroup)
+    // ────────────────────────────────────────────────────────────────────────
+    const [networkMode, setNetworkMode] = useState<NetworkMode>(() => {
+      try {
+        return (localStorage.getItem(NETWORK_MODE_STORAGE_KEY) as NetworkMode) || 'relay';
+      } catch {
+        return 'relay';
+      }
+    });
+    const [networkPeerCount, setNetworkPeerCount] = useState(0);
+    const [networkGroups, setNetworkGroups] = useState<(F2FGroupInfo | RtcGroupInfo)[]>([]);
+    const [networkLastError, setNetworkLastError] = useState<string | null>(null);
+    const [networkSeedNodes, setNetworkSeedNodes] = useState<F2FPeerInfo[]>([]);
+    const [networkBootstrapDone, setNetworkBootstrapDone] = useState(false);
+    const [invitationCode, setInvitationCode] = useState<string | null>(null);
+
+    const networkManagerRef = useRef<NetworkManager | null>(null);
+
+    function setNetworkModePersisted(next: NetworkMode) {
+      setNetworkMode(next);
+      try {
+        localStorage.setItem(NETWORK_MODE_STORAGE_KEY, next);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    useEffect(() => {
+      const mgr = createNetworkManager({
+        mode: networkMode,
+        privKeyHex: privKey ?? '',
+        relayClients: Array.from(relay.clients.values()),
+        seedRelayUrl: relayUrls[0],
+      });
+
+      mgr.onEvent = (ev) => {
+        if (ev.type === 'peer_connected' || ev.type === 'peer_disconnected') {
+          setNetworkPeerCount(mgr.getPeerCount());
+        } else if (ev.type === 'group_updated' || ev.type === 'group_joined') {
+          setNetworkGroups(mgr.getGroups());
+        } else if (ev.type === 'seed_nodes') {
+          setNetworkSeedNodes(ev.nodes);
+        } else if (ev.type === 'error') {
+          setNetworkLastError(ev.message);
+        }
+      };
+
+      networkManagerRef.current = mgr;
+      setNetworkPeerCount(mgr.getPeerCount());
+      setNetworkGroups(mgr.getGroups());
+      setInvitationCode(null);
+
+      return () => {
+        mgr.close();
+      };
+    }, [networkMode, privKey, relayUrlsKey]);
+
+    async function handleNetworkBootstrap() {
+      const mgr = networkManagerRef.current;
+      if (!mgr || networkMode !== 'f2f') return;
+      // F2FManager の bootstrap を呼ぶには cast が必要
+      const f2fMgr = mgr as any;
+      if (typeof f2fMgr.bootstrap === 'function') {
+        setNetworkBootstrapDone(false);
+        const ok = await f2fMgr.bootstrap();
+        if (ok) setNetworkBootstrapDone(true);
+      }
+    }
+
+    async function handleNetworkCreateGroup() {
+      const mgr = networkManagerRef.current;
+      if (!mgr) return;
+      if (networkMode === 'f2f') {
+        const f2fMgr = mgr as any;
+        if (typeof f2fMgr.createGroup === 'function') {
+          const group = f2fMgr.createGroup();
+          setNetworkGroups(mgr.getGroups());
+          setNetworkLastError(null);
+          return group;
+        }
+      } else if (networkMode === 'rtcgroup') {
+        const rtgMgr = mgr as any;
+        if (typeof rtgMgr.createGroup === 'function') {
+          const group = rtgMgr.createGroup();
+          setNetworkGroups(mgr.getGroups());
+          setNetworkLastError(null);
+          return group;
+        }
+      }
+    }
+
+    async function handleNetworkJoinGroup(groupId: string) {
+      const mgr = networkManagerRef.current;
+      if (!mgr || networkMode !== 'rtcgroup') return;
+      const rtgMgr = mgr as any;
+      if (typeof rtgMgr.joinGroup === 'function') {
+        const group = rtgMgr.joinGroup(groupId);
+        setNetworkGroups(mgr.getGroups());
+        setNetworkLastError(null);
+        return group;
+      }
+    }
+
+    async function handleNetworkCreateInvitation() {
+      const mgr = networkManagerRef.current;
+      if (!mgr || networkMode !== 'f2f') return;
+      const f2fMgr = mgr as any;
+      if (typeof f2fMgr.createInvitation === 'function') {
+        const code = await f2fMgr.createInvitation();
+        setInvitationCode(code);
+      }
+    }
+
+    async function handleNetworkConnectInvitation(code: string) {
+      const mgr = networkManagerRef.current;
+      if (!mgr || networkMode !== 'f2f') return;
+      const f2fMgr = mgr as any;
+      if (typeof f2fMgr.connectWithInvitation === 'function') {
+        await f2fMgr.connectWithInvitation(code);
+      }
+    }
 
    // ミュート中の pubkey(Fodpr / Nostr 共通、localStorage 永続化)
    const [mutedPubkeys, setMutedPubkeys] = useState<Set<string>>(loadMutedPubkeys);
@@ -1661,7 +1793,7 @@ function App() {
     if (!privKey) return;
     const self = profileMap[pubkeyHex];
     if (!self) return;
-    const p = parseProfile(self.content);
+    const p = parseProfile(eventContentStr(self));
     if (!name && !about && !picture) {
       setName(p.name ?? '');
       setAbout(p.about ?? '');
@@ -1682,9 +1814,9 @@ function App() {
     const m: ReactionMap = new Map();
     for (const e of reactions) {
       const key = reactionTarget(e);
-      if (!key || !e.content.trim()) continue;
+      if (!key || !eventContentStr(e).trim()) continue;
       const list = m.get(key) ?? [];
-      list.push({ emoji: e.content, pubkey: CryptoUtils.bytesToHex(e.pubkey), createdAt: e.createdAt });
+      list.push({ emoji: eventContentStr(e), pubkey: CryptoUtils.bytesToHex(e.pubkey), createdAt: e.createdAt });
       m.set(key, list);
     }
     return m;
@@ -1850,7 +1982,7 @@ function App() {
       if (CryptoUtils.bytesToHex(e.pubkey) === pubkeyHex) {
         if (e.transType === TransTypeJSON) {
           try {
-            const obj = JSON.parse(e.content);
+        const obj = JSON.parse(eventContentStr(e));
             if (obj?.mode === 'profile') continue;
           } catch {
             /* profile 判定失敗は投稿として扱う */
@@ -2391,7 +2523,7 @@ function App() {
       createdAt: Math.floor(Date.now() / 1000),
       pubkey: pubkeyBytes,
       tags,
-      content,
+      content: new TextEncoder().encode(content),
       signature: CryptoUtils.hexToBytes(signatureHex),
     };
     // Optimistic: 自フィードに即反映
@@ -2417,7 +2549,8 @@ function App() {
       targetType: DelTargetEvent,
       pubkey: targetEvent.pubkey,
       createdAt: targetEvent.createdAt,
-      contentHash: computeSHA256(targetEvent.content),
+      contentHash: new Uint8Array(sha256(targetEvent.content)),
+      eventId: new Uint8Array(),
       signature: new Uint8Array(),
     };
     const signedData = Protocol.encodeDelSignedData(delReq);
@@ -2747,18 +2880,18 @@ function App() {
     }
   }
 
-   // NIP-79 (Nosskey)で登録済みのパスキーから WebAuthn 照証を要求し秘密鍵を再生してログイン。
-   // PRF は認証(生体)を伴うため、ページリロード後は毎回この手続きで再生する必要がある。
-   async function handleNostrPasskeyLogin() {
-     if (!nostrPasskeyCred) throw new Error('パスキー(credential)が登録されていません');
-     const { privKey } = await loginNosskeyPasskey(nostrPasskeyCred.credId);
-     setNostrPrivKey(privKey);
-     if (!privKey) {
-       setGuestMode(true);
-       setActiveTab('nostr');
-       localStorage.setItem(NOSTR_GUEST_STORAGE_KEY, '1');
-     }
-   }
+// NIP-79 (Nosskey)で登録済みのパスキーから WebAuthn 照証を要求し秘密鍵を再生してログイン。
+    // PRF は認証(生体)を伴うため、ページリロード後は毎回この手続きで再生する必要がある。
+    async function handleNostrPasskeyLogin() {
+      if (!nostrPasskeyCred) throw new Error('パスキー(credential)が登録されていません');
+      const { privKey } = await loginNosskeyPasskey();
+      setNostrPrivKey(privKey);
+      if (!privKey) {
+        setGuestMode(true);
+        setActiveTab('nostr');
+        localStorage.setItem(NOSTR_GUEST_STORAGE_KEY, '1');
+      }
+    }
 
     // NIP-79 パスキー(credential)の登録情報を完全に削除する。
     // 新しいパスキーを作ると新しい Nostr アイデンティティになるため、
@@ -2781,6 +2914,55 @@ function App() {
         setNostrQuoteTarget(null);
         localStorage.removeItem(NOSTR_GUEST_STORAGE_KEY);
         if (!privKey) setGuestMode(false);
+      }
+    }
+
+    // Nosskey (nosskey-sdk) で新規登録 (PRF direct mode)
+    async function handleNostrNosskeyRegister() {
+      const { privKey, pubkey, credId } = await registerNosskeyPasskey();
+      setNostrPrivKey(privKey);
+      setNostrPasskeyCred({ credId, pubkey });
+      try {
+        localStorage.setItem(NOSSKEY_CRED_STORAGE_KEY, JSON.stringify({ credId, pubkey }));
+      } catch {
+        /* 保存失敗は無視 */
+      }
+      if (!privKey) {
+        setGuestMode(true);
+        setActiveTab('nostr');
+        localStorage.setItem(NOSTR_GUEST_STORAGE_KEY, '1');
+      }
+    }
+
+    // Nosskey (nosskey-sdk) でログイン
+    async function handleNostrNosskeyLogin() {
+      const cred = getStoredNosskeyCred();
+      if (!cred) throw new Error('Nosskey credential が登録されていません');
+      const { privKey } = await loginNosskeyPasskey();
+      setNostrPrivKey(privKey);
+      if (!privKey) {
+        setGuestMode(true);
+        setActiveTab('nostr');
+        localStorage.setItem(NOSTR_GUEST_STORAGE_KEY, '1');
+      }
+    }
+
+    // 既存の nsec を Nosskey に保存 (wrap mode - nsec を PRF 派生 KEK で暗号化)
+    async function handleNostrSaveNsecToNosskey(nsecInput: string) {
+      const hex = normalizeNostrSecretKey(nsecInput);
+      getPublicKeyFromSecret(hex); // 不正な鍵はここでエラーになる
+      const { pubkey, credId } = await saveNsecToNosskey(hex);
+      setNostrPrivKey(hex);
+      setNostrPasskeyCred({ credId, pubkey });
+      try {
+        localStorage.setItem(NOSSKEY_CRED_STORAGE_KEY, JSON.stringify({ credId, pubkey }));
+      } catch {
+        /* 保存失敗は無視 */
+      }
+      if (!privKey) {
+        setGuestMode(true);
+        setActiveTab('nostr');
+        localStorage.setItem(NOSTR_GUEST_STORAGE_KEY, '1');
       }
     }
 
@@ -2875,6 +3057,7 @@ function App() {
         : [];
     const tags = [
       ...baseTags,
+      ['client', 'Prrr'],
       ...buildNostrMentionPTags(content, buildNostrMentionLookup(nostrProfileMap)),
       ...buildNostrEmojiTags(content),
     ];
@@ -3061,7 +3244,11 @@ function App() {
          onNostrGenerate={handleGenerateNostr}
          onNostrPasskeyLogin={handleNostrPasskeyLogin}
          onNostrPasskeyRegister={handleNostrPasskeyRegister}
+         onNostrNosskeyLogin={handleNostrNosskeyLogin}
+         onNostrNosskeyRegister={handleNostrNosskeyRegister}
+         onNostrSaveNsecToNosskey={handleNostrSaveNsecToNosskey}
          passkeyRegistered={!!nostrPasskeyCred}
+         nosskeyRegistered={hasNosskeyCredential()}
          onGuest={handleGuest}
          nostrLoggedIn={!!nostrPubkeyHex}
        />
@@ -3404,6 +3591,20 @@ function App() {
                   mutedPubkeys={mutedPubkeys}
                   onToggleMute={toggleMute}
                   profileMap={profileMap}
+                  networkMode={networkMode}
+                  onSetNetworkMode={setNetworkModePersisted}
+                  networkPeerCount={networkPeerCount}
+                  networkGroups={networkGroups}
+                  networkLastError={networkLastError}
+                  networkBootstrapDone={networkBootstrapDone}
+                  onNetworkBootstrap={handleNetworkBootstrap}
+                  onNetworkCreateGroup={handleNetworkCreateGroup}
+                  onNetworkJoinGroup={handleNetworkJoinGroup}
+                  onNetworkCreateInvitation={handleNetworkCreateInvitation}
+                  onNetworkConnectInvitation={handleNetworkConnectInvitation}
+                  networkSeedNodes={networkSeedNodes}
+                  invitationCode={invitationCode}
+                  setInvitationCode={setInvitationCode}
                 />
               )}
             </>
@@ -3495,24 +3696,25 @@ function App() {
                   onSave={handleNostrSaveProfile}
                 />
               )}
-               {view === 'settings' && (
-                  <NostrSettingsView
-                    relayUrls={nostrRelayUrls}
-                    onRelayChange={updateNostrRelays}
-                    relayStatus={nostrRelay.relayStatus}
-                    relayConnected={nostrRelay.connected}
-                    onLogout={handleNostrLogout}
-                    secretHex={nostrPrivKey}
-                    nip07Pubkey={nostrNip07Pubkey}
-                    loginMethod={nostrLoginMethod}
-                    passkeyCred={nostrPasskeyCred}
-                    onNostrPasskeyRemove={handleNostrPasskeyRemove}
-                    relayList={nostrRelayList}
-                    mutedPubkeys={mutedPubkeys}
-                    onToggleMute={toggleMute}
-                    profileMap={nostrProfileMap}
-                  />
-                )}
+{view === 'settings' && (
+                   <NostrSettingsView
+                     relayUrls={nostrRelayUrls}
+                     onRelayChange={updateNostrRelays}
+                     relayStatus={nostrRelay.relayStatus}
+                     relayConnected={nostrRelay.connected}
+                     onLogout={handleNostrLogout}
+                     secretHex={nostrPrivKey}
+                     nip07Pubkey={nostrNip07Pubkey}
+                     loginMethod={nostrLoginMethod}
+                     passkeyCred={nostrPasskeyCred}
+                     onNostrPasskeyRemove={handleNostrPasskeyRemove}
+                     onNostrSaveNsecToNosskey={handleNostrSaveNsecToNosskey}
+                     relayList={nostrRelayList}
+                     mutedPubkeys={mutedPubkeys}
+                     onToggleMute={toggleMute}
+                     profileMap={nostrProfileMap}
+                   />
+                 )}
             </>
           )}
         </main>
@@ -3681,7 +3883,7 @@ function PostCard({
 
   // Binary だがメディアとしてパースできないイベントは簡易表示する
   if (e.transType === TransTypeBinary) {
-    const media = parseImageContent(e.content);
+    const media = parseImageContent(eventContentStr(e));
     if (!media) {
       return (
         <div className="rounded-lg border border-white/10 bg-black/30 p-3 text-sm text-gray-400">
@@ -3821,7 +4023,7 @@ function PostCard({
             </div>
           )}
           <p className="mt-2 text-lg leading-relaxed whitespace-pre-wrap break-words sm:text-xl">
-            {renderFodprContent(e.content, parseFodprEmojiTags(e.tags), mentionLookup, onOpenUser)}
+            {renderFodprContent(eventContentStr(e), parseFodprEmojiTags(e.tags), mentionLookup, onOpenUser)}
           </p>
           <PostActions
             targetKey={key}
@@ -4431,9 +4633,9 @@ function SharedCard({
             onDelete={onDelete}
           />
         </div>
-        {isQuote && e.content.trim() && (
+        {isQuote && eventContentStr(e).trim() && (
           <p className="mb-2 whitespace-pre-wrap break-words px-1 text-lg leading-relaxed text-gray-100 sm:text-xl">
-            {renderFodprContent(e.content, parseFodprEmojiTags(e.tags), mentionLookup, onOpenUser)}
+            {renderFodprContent(eventContentStr(e), parseFodprEmojiTags(e.tags), mentionLookup, onOpenUser)}
           </p>
         )}
         {target ? (
@@ -4657,7 +4859,7 @@ function ReplyThread({
             />
           </div>
             <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-100">
-              {renderFodprContent(r.content, parseFodprEmojiTags(r.tags), mentionLookup, onOpenUser)}
+              {renderFodprContent(eventContentStr(r), parseFodprEmojiTags(r.tags), mentionLookup, onOpenUser)}
             </p>
             {parentName && (
               <p className="mt-1 text-xs text-gray-500">
@@ -5524,6 +5726,7 @@ function NostrSettingsView({
   loginMethod,
   passkeyCred,
   onNostrPasskeyRemove,
+  onNostrSaveNsecToNosskey,
   relayList,
   mutedPubkeys,
   onToggleMute,
@@ -5539,6 +5742,7 @@ function NostrSettingsView({
    loginMethod: 'nsec' | 'nip07' | 'passkey' | null;
    passkeyCred: NosskeyCred | null;
    onNostrPasskeyRemove: () => void;
+   onNostrSaveNsecToNosskey: (nsecHex: string) => Promise<void>;
    relayList: RelayList | null;
    mutedPubkeys: Set<string>;
    onToggleMute: (pubkeyHex: string) => void;
@@ -5741,25 +5945,43 @@ function NostrSettingsView({
                  </button>
                </div>
 
-               {/* NIP-79 パスキー(credential)の管理: 登録済みなら削除(新規登録でアイデンティティ切替) */}
-               {passkeyCred && (
-                 <div className="flex items-center justify-between border-t border-white/10 pt-3">
-                   <div>
-                     <p className="text-sm font-medium text-white">パスキー (Nosskey) 登録を削除</p>
-                     <p className="mt-0.5 text-xs text-gray-400">
-                       保存済みパスキー credential を忘れます(新規登録で別アイデンティティ)
-                     </p>
-                   </div>
-                   <button
-                     onClick={onNostrPasskeyRemove}
-                     className="rounded-xl border border-orange-400/40 px-4 py-2 text-sm text-orange-300 transition-colors hover:bg-orange-400/10"
-                   >
-                     削除
-                   </button>
-                 </div>
-               )}
-             </>
-           ) : passkeyCred ? (
+{/* NIP-79 パスキー(credential)の管理: 登録済みなら削除(新規登録でアイデンティティ切替) */}
+                {passkeyCred && (
+                  <div className="flex items-center justify-between border-t border-white/10 pt-3">
+                    <div>
+                      <p className="text-sm font-medium text-white">パスキー (Nosskey) 登録を削除</p>
+                      <p className="mt-0.5 text-xs text-gray-400">
+                        保存済みパスキー credential を忘れます(新規登録で別アイデンティティ)
+                      </p>
+                    </div>
+                    <button
+                      onClick={onNostrPasskeyRemove}
+                      className="rounded-xl border border-orange-400/40 px-4 py-2 text-sm text-orange-300 transition-colors hover:bg-orange-400/10"
+                    >
+                      削除
+                    </button>
+                  </div>
+                )}
+
+                {/* nsec を Nosskey (wrap mode) に保存: nsec でログイン中の場合のみ表示 */}
+                {loginMethod === 'nsec' && secretHex && (
+                  <div className="flex items-center justify-between border-t border-white/10 pt-3">
+                    <div>
+                      <p className="text-sm font-medium text-white">この nsec を Nosskey に保存</p>
+                      <p className="mt-0.5 text-xs text-gray-400">
+                        現在の nsec を PRF 派生鍵で暗号化してパスキーに保存します (wrap モード)
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => void onNostrSaveNsecToNosskey(secretHex)}
+                      className="rounded-xl border border-amber/40 bg-amber/5 px-4 py-2 text-sm text-amber transition-colors hover:bg-amber/10"
+                    >
+                      Nosskey に保存
+                    </button>
+                  </div>
+                )}
+              </>
+            ) : passkeyCred ? (
              <div className="flex items-center justify-between">
                <div>
                  <p className="text-sm font-medium text-white">パスキー (Nosskey) が登録済み</p>
@@ -6062,7 +6284,7 @@ function UserProfileView({
   mentionLookup: Map<string, MentionUser>;
 }) {
   const prof = profileMap[pubkeyHex];
-  const p = prof ? parseProfile(prof.content) : {};
+  const p = prof ? parseProfile(eventContentStr(prof)) : {};
   const name = p.name ?? pubkeyHex.slice(0, 12);
   const allReplyEvents: FodprEvent[] = [];
   for (const list of replies.values()) allReplyEvents.push(...list);
@@ -6447,6 +6669,20 @@ function SettingsView({
   mutedPubkeys,
   onToggleMute,
   profileMap,
+  networkMode,
+  onSetNetworkMode,
+  networkPeerCount,
+  networkGroups,
+  networkLastError,
+  networkBootstrapDone,
+  onNetworkBootstrap,
+  onNetworkCreateGroup,
+  onNetworkJoinGroup,
+  onNetworkCreateInvitation,
+  onNetworkConnectInvitation,
+  networkSeedNodes,
+  invitationCode,
+  setInvitationCode: _setInvitationCode,
 }: {
   relayUrls: string[];
   onRelayChange: (urls: string[]) => void;
@@ -6454,7 +6690,7 @@ function SettingsView({
   relayConnected: boolean;
   onLogout: () => void;
   onShowDocs: () => void;
-   secretHex: string | null;
+  secretHex: string | null;
   browserNotifEnabled: boolean;
   notifPermission: NotificationPermission;
   onToggleBrowserNotif: (next: boolean) => void;
@@ -6462,6 +6698,20 @@ function SettingsView({
   mutedPubkeys: Set<string>;
   onToggleMute: (pubkeyHex: string) => void;
   profileMap: Record<string, FodprEvent>;
+  networkMode: NetworkMode;
+  onSetNetworkMode: (mode: NetworkMode) => void;
+  networkPeerCount: number;
+  networkGroups: (F2FGroupInfo | RtcGroupInfo)[];
+  networkLastError: string | null;
+  networkBootstrapDone: boolean;
+  onNetworkBootstrap: () => void;
+  onNetworkCreateGroup: () => void;
+  onNetworkJoinGroup: (groupId: string) => void;
+  onNetworkCreateInvitation: () => Promise<void>;
+  onNetworkConnectInvitation: (code: string) => Promise<void>;
+  networkSeedNodes: F2FPeerInfo[];
+  invitationCode: string | null;
+  setInvitationCode: (code: string | null) => void;
 }) {
   const [relayInput, setRelayInput] = useState('');
   const [msg, setMsg] = useState<string | null>(null);
@@ -6609,12 +6859,219 @@ function SettingsView({
         </div>
       </LiquidGlass>
 
+      {/* ネットワークモード設定。fsec 保有ユーザー(fodpr)のみ表示 */}
+      {!!secretHex && (
+        <LiquidGlass intensity="subtle" refractive={false} className="liquid-glass--card w-full">
+          <div className="space-y-3 p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-white">ネットワークモード</p>
+                <p className="mt-0.5 text-xs text-gray-400">P2P 接続方式を選択します</p>
+              </div>
+            </div>
+
+            <div className="space-y-2 border-t border-white/10 pt-3">
+              <div className="flex flex-wrap gap-2">
+                {(['f2f', 'rtcgroup', 'relay'] as NetworkMode[]).map((mode) => (
+                  <button
+                    key={mode}
+                    onClick={() => onSetNetworkMode(mode)}
+                    className={
+                      'shrink-0 rounded-xl border px-4 py-2 text-sm font-semibold transition-colors ' +
+                      (networkMode === mode
+                        ? 'border-primary bg-primary/10 text-primary'
+                        : 'border-white/15 text-gray-300 hover:bg-white/10')
+                    }
+                  >
+                    {mode === 'f2f' && 'F2F (WoT)'}
+                    {mode === 'rtcgroup' && 'RtcGroup (ホスト昇格)'}
+                    {mode === 'relay' && 'リレーのみ'}
+                  </button>
+                ))}
+              </div>
+
+              <p className="text-xs text-gray-400">
+                {networkMode === 'f2f' && 'Web of Trust 方式。知り合いを介して最大50人まで接続し、招待コードまたはリレーシードでブートストラップ。'}
+                {networkMode === 'rtcgroup' && 'ホスト昇格型。最初の接続者がホストとなり、ホスト離脱時に最古参加者が昇格。'}
+                {networkMode === 'relay' && 'リレーサーバー経由のみ。P2P 接続を行いません。'}
+              </p>
+
+              {networkMode === 'f2f' && (
+                <div className="space-y-2.5 border-t border-white/10 pt-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-gray-400">接続ピア数</span>
+                    <span className="text-sm font-semibold text-white">{networkPeerCount}</span>
+                  </div>
+
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-gray-400">キャッシュピア数</span>
+                    <span className="text-sm font-semibold text-white">{networkSeedNodes.length}</span>
+                  </div>
+
+                  <div className="space-y-2 pt-2 border-t border-white/10">
+                      <div className="space-y-2">
+                        <p className="text-xs font-medium text-gray-300">招待コードで接続</p>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            placeholder="招待コード (f2finv1...)"
+                            className="flex-1 rounded-xl bg-black/30 border border-white/15 px-3 py-2 text-xs text-white placeholder-gray-500"
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                const code = e.currentTarget.value.trim();
+                                if (code) {
+                                  e.currentTarget.value = '';
+                                  onNetworkConnectInvitation(code);
+                                }
+                              }
+                            }}
+                          />
+                          <button
+                            onClick={() => {
+                              const code = prompt('招待コードを入力してください (f2finv1...)');
+                              if (code?.trim()) onNetworkConnectInvitation(code.trim());
+                            }}
+                            className="shrink-0 rounded-xl border border-white/15 px-3 py-2 text-xs font-semibold text-gray-300 transition-colors hover:bg-white/10"
+                          >
+                            接続
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="space-y-2 pt-2 border-t border-white/10">
+                        <div className="flex items-center gap-2">
+                          <p className="text-xs font-medium text-gray-300 shrink-0 w-36">招待コード発行</p>
+                          <button
+                            onClick={async () => {
+                              await onNetworkCreateInvitation();
+                            }}
+                            className="shrink-0 rounded-xl bg-primary px-3 py-2 text-xs font-semibold text-bg transition-colors hover:bg-primary-hover"
+                          >
+                            発行
+                          </button>
+                          {invitationCode && (
+                            <>
+                              <input
+                                type="text"
+                                value={invitationCode}
+                                readOnly
+                                className="flex-1 rounded-xl bg-black/30 border border-white/15 px-3 py-2 text-xs text-white font-mono select-all"
+                              />
+                              <button
+                                onClick={async () => {
+                                  await navigator.clipboard.writeText(invitationCode);
+                                  setMsg?.('招待コードをコピーしました');
+                                  setTimeout(() => setMsg?.(null), 2000);
+                                }}
+                                className="shrink-0 rounded-xl border border-white/15 px-3 py-2 text-xs font-semibold text-gray-300 transition-colors hover:bg-white/10"
+                              >
+                                コピー
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {networkLastError && <p className="text-xs text-red-400">{networkLastError}</p>}
+
+                  <div className="flex flex-wrap gap-2 pt-1">
+                    <button
+                      onClick={onNetworkBootstrap}
+                      className="rounded-xl border border-white/15 px-3 py-1.5 text-xs font-semibold text-gray-300 transition-colors hover:bg-white/10"
+                    >
+                      {networkBootstrapDone ? '再取得' : 'シード取得'}
+                    </button>
+                  </div>
+
+                  {networkSeedNodes.length > 0 && (
+                    <div className="space-y-1">
+                      <p className="text-xs text-gray-400">シードから取得したピア候補</p>
+                      {networkSeedNodes.slice(0, 5).map((p) => (
+                        <div key={p.pubkey} className="flex items-center gap-2 rounded-xl bg-black/30 px-3 py-1.5">
+                          <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-gray-400">
+                            {p.pubkey.slice(0, 16)}…
+                          </span>
+                          <span className="shrink-0 text-[10px] text-gray-500">信頼 {p.trustScore.toFixed(2)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {networkMode === 'rtcgroup' && (
+                <div className="space-y-2.5 border-t border-white/10 pt-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-gray-400">接続ピア数</span>
+                    <span className="text-sm font-semibold text-white">{networkPeerCount}</span>
+                  </div>
+
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-gray-400">参加グループ数</span>
+                    <span className="text-sm font-semibold text-white">{networkGroups.length}</span>
+                  </div>
+
+                  {networkGroups.length > 0 && (
+                    <div className="space-y-1.5">
+                      {networkGroups.map((g) => (
+                        <div key={g.groupId} className="rounded-xl bg-black/30 px-3 py-2">
+                          <div className="flex items-center justify-between">
+                            <span className="min-w-0 truncate text-xs text-gray-300">
+                              {g.groupId.slice(0, 16)}… ({g.members.length}人)
+                            </span>
+                            <span
+                              className={
+                                'shrink-0 rounded-full px-2 py-0.5 text-[10px] ' +
+                                (g.isHost ? 'bg-primary/20 text-primary' : 'bg-white/10 text-gray-300')
+                              }
+                            >
+                              {g.isHost ? 'ホスト' : 'ゲスト'}
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {networkLastError && <p className="text-xs text-red-400">{networkLastError}</p>}
+
+                  <div className="flex flex-wrap gap-2 pt-1">
+                    <button
+                      onClick={onNetworkCreateGroup}
+                      className="rounded-xl bg-primary px-3 py-1.5 text-xs font-semibold text-bg transition-colors hover:bg-primary-hover"
+                    >
+                      グループ作成 (ホストになる)
+                    </button>
+                    <button
+                      onClick={() => {
+                        const groupId = prompt('ホストの fpub を入力してください');
+                        if (groupId) onNetworkJoinGroup(groupId.trim());
+                      }}
+                      className="rounded-xl border border-white/15 px-3 py-1.5 text-xs font-semibold text-gray-300 transition-colors hover:bg-white/10"
+                    >
+                      グループ参加 (ホスト fpub 指定)
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {networkMode === 'relay' && (
+                <div className="space-y-2.5 border-t border-white/10 pt-3">
+                  <p className="text-xs text-gray-400">リレーサーバー経由でメッセージを送受信します。P2P 接続は行いません。</p>
+                </div>
+              )}
+            </div>
+          </div>
+        </LiquidGlass>
+      )}
+
       {/* ミュート中のユーザー一覧 */}
       <MuteListCard
         mutedPubkeys={mutedPubkeys}
         onToggleMute={onToggleMute}
         displayNames={Object.fromEntries(
-          Object.entries(profileMap).map(([pk, ev]) => [pk, parseProfile(ev.content).name ?? pk]),
+          Object.entries(profileMap).map(([pk, ev]) => [pk, parseProfile(eventContentStr(ev)).name ?? pk]),
         )}
       />
 
@@ -6836,7 +7293,11 @@ function LoginScreen({
   onNostrGenerate,
   onNostrPasskeyLogin,
   onNostrPasskeyRegister,
+  onNostrNosskeyLogin,
+  onNostrNosskeyRegister,
+  onNostrSaveNsecToNosskey,
   passkeyRegistered,
+  nosskeyRegistered,
   onGuest,
   nostrLoggedIn,
 }: {
@@ -6847,7 +7308,11 @@ function LoginScreen({
   onNostrGenerate: () => Promise<void>;
   onNostrPasskeyLogin: () => Promise<void>;
   onNostrPasskeyRegister: () => Promise<void>;
+  onNostrNosskeyLogin: () => Promise<void>;
+  onNostrNosskeyRegister: () => Promise<void>;
+  onNostrSaveNsecToNosskey: (nsecHex: string) => Promise<void>;
   passkeyRegistered: boolean;
+  nosskeyRegistered: boolean;
   onGuest: () => void;
   nostrLoggedIn: boolean;
 }) {
@@ -6887,7 +7352,7 @@ function LoginScreen({
     }
   }
 
-  // NIP-79 (Nosskey): パスキーでログイン/新規登録。登録済みなら再ログイン、未登録なら新規作成。
+  // ネイティブ パスキー (Passkey) でログイン/新規登録
   async function passkeyLogin() {
     setError('');
     setBusy(true);
@@ -6904,6 +7369,41 @@ function LoginScreen({
     setBusy(true);
     try {
       await onNostrPasskeyRegister();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+
+  // Nosskey (nosskey-sdk) でログイン/新規登録
+  async function nosskeyLogin() {
+    setError('');
+    setBusy(true);
+    try {
+      await onNostrNosskeyLogin();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+
+  async function nosskeyRegister() {
+    setError('');
+    setBusy(true);
+    try {
+      await onNostrNosskeyRegister();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+
+  // 入力された nsec を Nosskey に保存
+  async function saveNsecToNosskey() {
+    setError('');
+    setBusy(true);
+    try {
+      await onNostrSaveNsecToNosskey(keyInput);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setBusy(false);
@@ -7016,50 +7516,84 @@ function LoginScreen({
                     className="w-full rounded-xl bg-black/30 px-3 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-white/25"
                   />
                    {nostrLoggedIn && (
-                     <p className="text-xs text-green-400">このブラウザには nsec が保存されています。</p>
-                   )}
-                   <button
-                     onClick={() => void nip07Login()}
-                     disabled={busy}
-                     className="mt-2 w-full rounded-xl border border-primary/40 bg-primary/5 py-2 text-xs text-primary transition-colors hover:bg-primary/10 disabled:opacity-50"
-                   >
-                     {nip07Available
-                       ? 'ブラウザ拡張 (NIP-07) でログイン'
-                        : 'ブラウザ拡 (NIP-07) でログイン — 拡張がありません'}
-                   </button>
+                      <p className="text-xs text-green-400">このブラウザには nsec が保存されています。</p>
+                    )}
+                  <button
+                    onClick={() => void nip07Login()}
+                    disabled={busy}
+                    className="mt-2 w-full rounded-xl border border-primary/40 bg-primary/5 py-2 text-xs text-primary transition-colors hover:bg-primary/10 disabled:opacity-50"
+                  >
+                    {nip07Available
+                      ? 'ブラウザ拡張 (NIP-07) でログイン'
+                       : 'ブラウザ拡 (NIP-07) でログイン — 拡張がありません'}
+                  </button>
 
-                   {/* NIP-79 (Nosskey / PRF) パスキーでログイン/新規登録 */}
-                   <div className="mt-2 space-y-2">
-                     {passkeyRegistered ? (
-                       <p className="text-xs text-green-400">パスキー (Nosskey)が登録されています。</p>
-                     ) : (
-                       <p className="text-xs text-gray-400">
-                         パスキー (Nosskey) : WebAuthn PRF で Nostr 鍵を派生。秘密鍵は永続化されません。
-                       </p>
-                     )}
-                     {passkeyRegistered ? (
-                       <button
-                         onClick={() => void passkeyLogin()}
-                         disabled={busy}
-                         className="w-full rounded-xl border border-emerald/40 bg-emerald/5 py-2 text-xs text-emerald transition-colors hover:bg-emerald/10 disabled:opacity-50"
-                       >
-                         {busy ? '処理中...' : 'パスキー (Nosskey) でログイン'}
-                       </button>
-                     ) : (
-                       <button
-                         onClick={() => void passkeyRegister()}
-                         disabled={busy || !passkeyAvailable}
-                         className="w-full rounded-xl border border-emerald/40 bg-emerald/5 py-2 text-xs text-emerald transition-colors hover:bg-emerald/10 disabled:opacity-50"
-                       >
-                         {!passkeyAvailable
-                           ? 'パスキー (Nosskey) で新規登録 — 使えません'
-                           : busy
-                             ? '処理中...'
-                             : 'パスキー (Nosskey) で新規登録'}
-                       </button>
-                     )}
-                   </div>
-                 </>
+                  {/* ネイティブ パスキー (Passkey) */}
+                  <div className="mt-2 space-y-2">
+                    <p className="text-xs text-gray-400">
+                      パスキー (Passkey) : 端末の生体認証で Nostr 鍵を作成/ログイン。秘密鍵はパスキー内に保存されます。
+                    </p>
+                    {passkeyRegistered ? (
+                      <button
+                        onClick={() => void passkeyLogin()}
+                        disabled={busy}
+                        className="w-full rounded-xl border border-emerald/40 bg-emerald/5 py-2 text-xs text-emerald transition-colors hover:bg-emerald/10 disabled:opacity-50"
+                      >
+                        {busy ? '処理中...' : 'パスキー (Passkey) でログイン'}
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => void passkeyRegister()}
+                        disabled={busy || !passkeyAvailable}
+                        className="w-full rounded-xl border border-emerald/40 bg-emerald/5 py-2 text-xs text-emerald transition-colors hover:bg-emerald/10 disabled:opacity-50"
+                      >
+                        {!passkeyAvailable
+                          ? 'パスキー (Passkey) で新規登録 — 使えません'
+                          : busy
+                            ? '処理中...'
+                            : 'パスキー (Passkey) で新規登録'}
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Nosskey (nosskey-sdk) */}
+                  <div className="mt-2 space-y-2">
+                    <p className="text-xs text-gray-400">
+                      Nosskey : nosskey-sdk を使用。PRF 派生鍵または nsec を暗号化保存。パスキー UI 以外の選択肢として利用可能。
+                    </p>
+                    {nosskeyRegistered ? (
+                      <button
+                        onClick={() => void nosskeyLogin()}
+                        disabled={busy}
+                        className="w-full rounded-xl border border-blue/40 bg-blue/5 py-2 text-xs text-blue transition-colors hover:bg-blue/10 disabled:opacity-50"
+                      >
+                        {busy ? '処理中...' : 'Nosskey でログイン'}
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => void nosskeyRegister()}
+                        disabled={busy || !passkeyAvailable}
+                        className="w-full rounded-xl border border-blue/40 bg-blue/5 py-2 text-xs text-blue transition-colors hover:bg-blue/10 disabled:opacity-50"
+                      >
+                        {!passkeyAvailable
+                          ? 'Nosskey で新規登録 — 使えません'
+                          : busy
+                            ? '処理中...'
+                            : 'Nosskey で新規登録'}
+                      </button>
+                    )}
+                    {/* 既存の nsec を Nosskey に保存 (wrap モード) */}
+                    {(keyInput.trim() && (keyInput.startsWith('nsec') || /^[0-9a-fA-F]{64}$/.test(keyInput))) && (
+                      <button
+                        onClick={() => void saveNsecToNosskey()}
+                        disabled={busy || !passkeyAvailable}
+                        className="w-full rounded-xl border border-amber/40 bg-amber/5 py-2 text-xs text-amber transition-colors hover:bg-amber/10 disabled:opacity-50"
+                      >
+                        {busy ? '処理中...' : 'この nsec を Nosskey に保存'}
+                      </button>
+                    )}
+                  </div>
+                </>
               )}
             </div>
 

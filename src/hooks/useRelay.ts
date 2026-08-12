@@ -87,5 +87,5 @@ export function useRelay(urls: string[]) {
     }
   }, []);
 
-  return { connected, relayStatus, messages, sendEvent, sendReq, sendDel };
+  return { connected, relayStatus, messages, sendEvent, sendReq, sendDel, clients: clientsRef.current };
 }

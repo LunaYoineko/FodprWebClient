@@ -25,6 +25,9 @@ It is built with TypeScript + React + Vite + Tailwind CSS and reuses the wire pr
   - Mobile: a pen (FAB) button at the bottom-right opens the composer as a centered modal
 - **Bundled REST API server** — `api/server.mjs` serves static files + image upload + relay bridge
 - **Client Implementation Guide** — a page opened from the Settings screen documents the post formats, tag specs, `dedupeKey` computation, and the relay list format
+- **F2F (Friend-to-Friend) / WoT P2P** — peer cache (max 50), invitation code (`f2finv1...`), signed PeerList exchange on P2P connection, auto-dial from cache (relay-free), WoT introduction
+- **RtcGroup (Host-Promotion P2P)** — first connection becomes host, others star-connect to host, oldest guest auto-promoted on host disconnect (`HOST_CHANGE` notification)
+- **Network mode switch** — Settings UI toggles between **F2F (WoT) / RtcGroup (Host-Promotion) / Relay Only**, persisted in `localStorage.fodpr_network_mode`
 
 ## Requirements
 
@@ -74,6 +77,10 @@ FODPR_API_PORT=8088
 7. **Profile** tab → edit and publish name / about / avatar (JSON for Fodpr, kind 0 for Nostr).
 8. In Nostr, click a user's name or avatar → fetch kind 0 and open their profile.
 9. **Settings** tab → add/remove relay URLs, copy the secret key, and open the **Client Implementation Guide** (formats & specs).
+10. **Settings** → **Network Mode** to select F2F / RtcGroup / Relay Only
+    - **F2F**: "Generate Invitation" button creates code → send to peer. "Connect with Invitation" for peer's code. "Fetch Seed" gets 50 peer candidates from relay
+    - **RtcGroup**: "Create Group" becomes host, or "Join Group" with host fpub
+    - **Relay Only**: no P2P connections
 
 ## Project Structure
 
@@ -115,6 +122,8 @@ FodprWebClient/
 - **Fodpr**: communication uses **binary WebSocket frames** only; text frames would corrupt the public-key/signature byte sequences under UTF-8.
 - **Nostr**: standard JSON text frames (NIP-01); handles kind 0/1/5/6/7/10002.
 - For the Fodpr event format / tag spec, see the **Client Implementation Guide** (`public/docs.html`, opened from Settings) or [`@fodpr/protocol`](../FodprTSSDK/src/protocol.ts).
+- **F2F PeerList exchange**: `TransTypePeerList` (0x09) / `MsgTypePeerListPush` (0x87) for signed peer cache (max 50) over P2P data channel. Auto-dial from merged cache (relay-free).
+- **RtcGroup**: `TransTypeWebRTC` + `to:<hostFpub>` subscription for WebRTC signaling relay. Host change via `HOST_CHANGE: <new_fpub>` text notification triggers re-subscription.
 
 ## Notes
 

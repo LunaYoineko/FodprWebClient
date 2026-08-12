@@ -19,6 +19,8 @@ pnpm dev --port 5199
 Relay (dev): `ws://localhost:8000` (docker `fodprrelay`). The app reads relays from
 `localStorage.fodpr_relays`; the test scripts seed it for you.
 
+Network mode: `localStorage.fodpr_network_mode` (`f2f` | `rtcgroup` | `relay`, default `relay`).
+
 ## Tests
 
 Run from `/tmp/opencode/pwtest`:
@@ -85,6 +87,24 @@ curl -s -o /dev/null -w '%{http_code}\n' https://prrr.yoinekodo.jp/docs.html
 curl -s -o /dev/null -w '%{http_code}\n' https://prrr.yoinekodo.jp/api/docs
 curl -s https://prrr.yoinekodo.jp/api/health
 ```
+
+## Network Modes (P2P)
+
+- **F2F (WoT)** — `src/lib/fodprF2f.ts`
+  - Peer cache: `localStorage.fodpr_f2f_peer_cache` (max 50, trustScore)
+  - Bootstrap: invitation code (`f2finv1...`) or relay seed (`bootstrap()`)
+  - PeerList exchange: `TransTypePeerList` (signed, max 50) over P2P data channel
+  - Auto-dial from received PeerList up to 50 connections
+
+- **RtcGroup (Host Promotion)** — `src/lib/rtcGroup.ts`
+  - Group ID = host fpub, star topology
+  - Signaling: `TransTypeWebRTC` + `to:<hostFpub>` relay subscription
+  - Host change: relay broadcasts `HOST_CHANGE: <new_fpub>`, clients re-subscribe
+  - Group state: `TransTypeGroup` with `group:<groupId>` tag for persistence
+
+- **Relay Only** — existing `useRelay` hook, no P2P
+
+Toggle via Settings UI (persisted in `localStorage.fodpr_network_mode`).
 
 ## Notes
 

@@ -58,12 +58,85 @@ import {
 } from './fodprF2f';
 import { DhtNode, isDhtFrame, DHT_RPC_TIMEOUT_MS, type DhtNodeInfo } from './dht';
 import { WoTStore } from './wot';
+import { lookup } from 'geoip-lite';
 
 export const BOOTSTRAP_NODES_KEY = 'fodpr_bootstrap_nodes';
 export const OWN_ADDRESSES_KEY = 'fodpr_own_addresses';
 const MAX_HOPS = 2;
 const MAX_EVENT_CACHE = 500;
 const MAX_CONNECTIONS = 50;
+
+// GeoIP ベース接続多様性: 国ごとの最小接続枠
+const DIVERSITY_PER_COUNTRY = 2;
+const GEOIP_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 1 週間
+
+// 簡易メモリキャッシュ: /64 プレフィクス -> 国コード (undefined なら未解決/失敗)
+const geoipCache = new Map<string, { cc: string | undefined; ts: number }>();
+
+/** IPv6 アドレスから /64 プレフィクスを抽出 (geoip-lite は IP 文字列で lookup 可能) */
+function extractIPv6Prefix(addr: string): string | null {
+  // "[2001:db8::1]:443" -> "2001:db8::1"
+  const m = addr.match(/\[?([0-9a-fA-F:]+)\]?(?::\d+)?$/);
+  if (!m) return null;
+  const ip = m[1];
+  // /64 に丸める: 最初の 4 セグメント (16*4=64bit)
+  const parts = ip.split(':');
+  if (parts.length < 4) return ip;
+  return parts.slice(0, 4).join(':') + '::';
+}
+
+/** 国コードを取得 (キャッシュ付き)。失敗時は undefined。 */
+function getCountryCode(ipv6Addr: string): string | undefined {
+  const prefix = extractIPv6Prefix(ipv6Addr);
+  if (!prefix) return undefined;
+  const cached = geoipCache.get(prefix);
+  const now = Date.now();
+  if (cached && now - cached.ts < GEOIP_CACHE_TTL_MS) return cached.cc ?? undefined;
+
+  const geo = lookup(prefix);
+  const cc = geo?.country ?? undefined;
+  geoipCache.set(prefix, { cc, ts: now });
+  return cc;
+}
+
+/**
+ * ダイヤル候補を地理的多様性を保って選抜する。
+ * - 国ごとに最大 DIVERSITY_PER_COUNTRY 件を優先採用
+ * - 残りはグローバル信頼スコア順で埋める
+ * - GeoIP 失敗は 'XX' バケツとして扱い、信頼順フォールバック
+ */
+function selectDiversePeers(candidates: F2FPeerInfo[]): F2FPeerInfo[] {
+  if (candidates.length === 0) return [];
+
+  // 国コードを付与 (明示的に F2FPeerInfo にキャスト)
+  const withCountry = candidates.map((p): F2FPeerInfo => ({
+    ...p,
+    country: p.addresses[0] ? getCountryCode(p.addresses[0]) : undefined,
+  }));
+
+  // 国ごとにバケツ分け
+  const buckets = new Map<string, F2FPeerInfo[]>();
+  for (const c of withCountry) {
+    const k = c.country ?? 'XX';
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k)!.push(c);
+  }
+
+  // 多様性枠: 各国から最大 DIVERSITY_PER_COUNTRY 件を優先採用 (信頼順)
+  const selected: F2FPeerInfo[] = [];
+  for (const [, arr] of buckets) {
+    arr.sort((a, b) => b.trustScore - a.trustScore);
+    selected.push(...arr.slice(0, DIVERSITY_PER_COUNTRY));
+  }
+
+  // 残りはグローバル信頼順で埋める (重複除外)
+  const remaining = withCountry
+    .filter((c) => !selected.some((s) => s.pubkey === c.pubkey))
+    .sort((a, b) => b.trustScore - a.trustScore);
+  selected.push(...remaining);
+
+  return selected;
+}
 
 /**
  * ビルトインコミュニティブートストラップアンカーノード (v0.6)。
@@ -712,12 +785,15 @@ export class MeshManager {
       this.onEvent?.({ type: 'peer_list_received', from: fromPubkey, peers: newPeers });
       this.onEvent?.({ type: 'seed_nodes', nodes: newPeers });
 
-      // WoT ゲートを通過した新ピアへダイアル
-      for (const p of newPeers) {
-        if (p.pubkey === this.pubkeyHex) continue;
-        if (this.connections.has(p.pubkey)) continue;
+      // WoT ゲートを通過した新ピアへダイアル (地理的多様性を考慮)
+      const dialable = newPeers.filter(
+        (p) => p.pubkey !== this.pubkeyHex &&
+               !this.connections.has(p.pubkey) &&
+               this.wot.isTrusted(p.pubkey)
+      );
+      const diverse = selectDiversePeers(dialable);
+      for (const p of diverse) {
         if (this.connections.size >= MAX_CONNECTIONS) break;
-        if (!this.wot.isTrusted(p.pubkey)) continue;
         this.connectToPeer(p.pubkey, p.addresses).catch(() => {});
       }
     } catch {

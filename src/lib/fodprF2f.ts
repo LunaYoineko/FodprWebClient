@@ -38,6 +38,7 @@ export interface F2FPeerInfo {
   addresses: string[];
   lastSeen: number;
   trustScore: number;
+  country?: string;  // GeoIP 国コード (ISO 3166-1 alpha-2), optional for backward compat
 }
 
 export interface F2FPeerCache {

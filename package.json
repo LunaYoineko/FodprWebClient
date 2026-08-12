@@ -13,6 +13,7 @@
   "devDependencies": {
     "@noble/hashes": "^2.2.0",
     "@noble/secp256k1": "^3.1.0",
+    "@types/geoip-lite": "^1.4.4",
     "@types/node": "^26.2.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
@@ -26,6 +27,7 @@
   "dependencies": {
     "@dpawlikowski/liquid-glass": "^0.3.0",
     "fodpr-ts-sdk": "file:../FodprTSSDK",
+    "geoip-lite": "^2.0.3",
     "nosskey-sdk": "^0.2.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"

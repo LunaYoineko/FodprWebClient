@@ -63,7 +63,7 @@ import {
 import { SteganographyText } from './lib/steganography';
 import type { F2FPeerInfo } from './lib/network';
 import { createNetworkManager, type NetworkManager, type MeshEvent } from './lib/network';
-import { loadBootstrapNodes, saveBootstrapNodes } from './lib/f2fMesh';
+import { loadBootstrapNodes, saveBootstrapNodes, FODPR_BOOTSTRAP_ANCHORS, BOOTSTRAP_SOURCE_KEY } from './lib/f2fMesh';
 
 // 既定の Nostr リレー(設定画面から追加・削除可能)
 const DEFAULT_NOSTR_RELAYS = ['wss://relay.yoinekodo.jp/'];
@@ -6743,7 +6743,14 @@ function SettingsView({
                   </button>
                 </div>
               ))}
-              {loadBootstrapNodes().length === 0 && <p className="text-[10px] text-gray-500">未登録</p>}
+              {loadBootstrapNodes().length === 0 && (
+                <p className="text-[10px] text-gray-500">
+                  未登録 (ビルトインコミュニティアンカー {FODPR_BOOTSTRAP_ANCHORS.length} 件を使用
+                  {typeof localStorage !== 'undefined' && localStorage.getItem(BOOTSTRAP_SOURCE_KEY) === 'builtin'
+                    ? '・使用中'
+                    : ''})
+                </p>
+              )}
             </div>
           </div>
 

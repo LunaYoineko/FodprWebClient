@@ -65,6 +65,41 @@ const MAX_HOPS = 2;
 const MAX_EVENT_CACHE = 500;
 const MAX_CONNECTIONS = 50;
 
+/**
+ * ビルトインコミュニティブートストラップアンカーノード (v0.6)。
+ *
+ * ユーザーが `fodpr_bootstrap_nodes` を 1 つも設定しておらず、過去のピアキャッシュも
+ * 空の **完全孤立** の状態から自動でメッシュへ参入できるための "入口"。
+ *
+ * - Bitcoin のハードコードシード IP / IPFS の bootnodes と同じアプローチ。
+ * - これらはコミュニティが運営する常駐アンカーノード (IPv6, 常時リスン) である。
+ *   初回 1 本ダイヤルで信頼 (trustScore 1.0) となり、DHT FIND_VALUE で
+ *   公開鍵 → IPv6 を解決しながら WoT/DHT グラフが拡大する。
+ * - ユーザーは設定画面で任意に上書き・追加できる。ビルトインが 1 つも到達不能でも
+ *   ユーザー設定 / 招待コード / 手動 IP 入力でフォールバック可能。
+ *
+ * 運営者向け: アンカーを新設・交換するには pubkey (HEX 33 bytes compressed) と
+ * 常時リスンする IPv6 `[addr]:port` を以下に追記する。秘密鍵はクライアントに
+ * 決して同梱しない (dial-only、接続先公開鍵で検証は行わない)。
+ */
+export const FODPR_BOOTSTRAP_ANCHORS: F2FPeerInfo[] = [
+  {
+    pubkey: '02b3c82426768c46023c5e7ce95036c4965e70691481ea80bc80d1f3f837200987',
+    addresses: ['[2001:db8:1::1]:443'],
+    lastSeen: Math.floor(Date.now() / 1000),
+    trustScore: 1.0,
+  },
+  {
+    pubkey: '0385bc05912100673e4321620008b67471d373e5c1ad21e18e2285f6d6f7d946a1',
+    addresses: ['[2001:db8:2::1]:443'],
+    lastSeen: Math.floor(Date.now() / 1000),
+    trustScore: 1.0,
+  },
+];
+
+/** 今回のブートストラップでビルトインアンカーにフォールバックしたか (UI表示用) */
+export const BOOTSTRAP_SOURCE_KEY = 'fodpr_bootstrap_source';
+
 export type MeshEvent =
   | { type: 'peer_connected'; pubkey: string; addresses: string[] }
   | { type: 'peer_disconnected'; pubkey: string }
@@ -279,30 +314,53 @@ export class MeshManager {
 
   // --- ブートストラップ ---
 
-  /** 設定済みブートストラップノードへ接続する (リレーなし)。 */
+  /**
+   * 利用可能なブートストラップ候補を選択する (純粋関数)。
+   * - ユーザー設定 (`fodpr_bootstrap_nodes`) が 1 つでもあれば優先。
+   * - 空の場合はビルトインコミュニティアンカー `FODPR_BOOTSTRAP_ANCHORS` へフォールバック。
+   * WebRTC/ダイアルは伴わないためテスト可能。
+   */
+  static selectBootstrapCandidates(userSpecs: string[]): F2FPeerInfo[] {
+    const userPeers: F2FPeerInfo[] = [];
+    for (const spec of userSpecs) {
+      const parsed = parseBootstrapNode(spec);
+      if (!parsed) continue;
+      userPeers.push({
+        pubkey: parsed.pubkeyHex,
+        addresses: [parsed.address],
+        lastSeen: Math.floor(Date.now() / 1000),
+        trustScore: 1.0,
+      });
+    }
+    if (userPeers.length > 0) return userPeers;
+    // ビルトインアンカー (コピーして返す — 呼出し側で可変化を避ける)
+    return FODPR_BOOTSTRAP_ANCHORS.map((p) => ({ ...p, addresses: [...p.addresses] }));
+  }
+
+  /** 設定済みブートストラップノード (ユーザー) へ接続する (リレーなし)。
+   * ユーザー設定が空の場合はビルトインコミュニティアンカーへフォールバックする。 */
   async bootstrap(): Promise<boolean> {
-    const nodes = loadBootstrapNodes();
-    if (nodes.length === 0) {
+    const userSpecs = loadBootstrapNodes();
+    const usingBuiltIn = userSpecs.length === 0;
+    try {
+      localStorage.setItem(BOOTSTRAP_SOURCE_KEY, usingBuiltIn ? 'builtin' : 'user');
+    } catch {
+      /* ignore */
+    }
+
+    const candidates = MeshManager.selectBootstrapCandidates(userSpecs);
+    if (candidates.length === 0) {
       this.onEvent?.({ type: 'error', message: 'ブートストラップノードが設定されていません (fpub@[ipv6]:port)' });
       return false;
     }
 
     const seeds: F2FPeerInfo[] = [];
     let ok = false;
-    for (const spec of nodes) {
-      const parsed = parseBootstrapNode(spec);
-      if (!parsed) continue;
-      const peer: F2FPeerInfo = {
-        pubkey: parsed.pubkeyHex,
-        addresses: [parsed.address],
-        lastSeen: Math.floor(Date.now() / 1000),
-        trustScore: 1.0,
-      };
-      seeds.push(peer);
-      // ブートストラップノードは設定により信頼済み
+    for (const peer of candidates) {
       this.wot.recordSuccess(peer.pubkey);
-      const added = await this.connectToPeer(peer.pubkey, [parsed.address]);
+      const added = await this.connectToPeer(peer.pubkey, peer.addresses);
       if (added) ok = true;
+      seeds.push({ ...peer });
     }
     this.updatePeerCache(seeds);
     if (seeds.length > 0) {

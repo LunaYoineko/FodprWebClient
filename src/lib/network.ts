@@ -1,141 +1,99 @@
 /**
  * network.ts
  * ----------
- * 統合ネットワーク層：3モード（F2F / Relay / RtcGroup）をトグルで切り替え。
+ * v0.6 "Mesh": 統合ネットワーク層 (F2F メッシュのみ)。
  *
- * - F2F: Web of Trust 方式。知り合いを介して最大50人まで接続し、P2P をマルチモーダルに確立。
- *   ブートストラップは招待コードまたはリレーのシード取得機能。
- * - Relay: リレー経由のサーバー中継メッセージング（既存の useRelay フックで実装済み）。
- * - RtcGroup: ホスト昇格型 P2P。最初に P2P を始めた人をホストとし、他の人はそのホストに接続。
- *   ホストが抜けた際は最古の joinedAt の人がホストに昇格し、全員が新ホストへ再接続。
+ * リレーサーバー・ホスト昇グループは存在しない。すべての接続はクライアント間
+ * (F2F) の WebRTC データチャネル。MeshManager がブートストラップ(招待コード /
+ * 設定済みブートストラップノード / 手動 IP)、WoT ゲート、DHT でのアドレス解決、
+ * ピアダイアル、ゴシップ配信を一手に責務する。
+ *
+ * App は createNetworkManager() で得た NetworkManager を 1 つだけ保持し、
+ * mesh イベントを onEvent コールバックで受け取る。モード切替はない (常に mesh)。
  */
 
-import { F2FManager, type F2FGroupInfo } from './fodprF2f';
-import { RtcGroupManager, type RtcGroupInfo } from './rtcGroup';
-import type { RelayClient } from './relay';
+import { MeshManager, type MeshEvent, type MeshManagerOptions } from './f2fMesh';
 import { CryptoUtils } from '@fodpr/crypto';
 
-export type NetworkMode = 'f2f' | 'relay' | 'rtcgroup';
+export type NetworkMode = 'f2f';
 
-export type { RtcGroupInfo };
+export type NetworkEvent = MeshEvent & { mode: 'f2f' };
 
-export interface NetworkManagerOptions {
-  mode: NetworkMode;
-  privKeyHex: string;
-  relayClients: RelayClient[];
+export interface NetworkManagerOptions extends MeshManagerOptions {
+  // v0.6 では不要だが API 互換性を保つため受け入れる
   seedRelayUrl?: string;
-}
-
-export interface NetworkEvent {
-  type: string;
-  [key: string]: any;
 }
 
 export interface NetworkManager {
   onEvent: ((ev: NetworkEvent) => void) | null;
   getPeerCount(): number;
-  getGroups(): (F2FGroupInfo | RtcGroupInfo)[];
   getMode(): NetworkMode;
-  setMode(mode: NetworkMode): Promise<void>;
+  bootstrap(): Promise<boolean>;
+  createInvitation(targetPubkeyHex?: string, expiresInSec?: number, scope?: number): Promise<string>;
+  connectWithInvitation(code: string): Promise<boolean>;
+  broadcastEvent(event: Parameters<MeshManager['broadcastEvent']>[0]): Promise<boolean>;
+  getPeerCache(): ReturnType<MeshManager['getPeerCache']>;
+  getDhtNodes(): ReturnType<MeshManager['getDhtNodes']>;
+  getTrustEntries(): ReturnType<MeshManager['getTrustEntries']>;
+  getLocalEvents(): ReturnType<MeshManager['getLocalEvents']>;
   close(): void;
 }
 
 class NetworkManagerImpl implements NetworkManager {
-  private currentMode: NetworkMode;
-  private privKeyHex: string;
-  private relayClients: RelayClient[];
-  private seedRelayUrl?: string;
-
-  private f2fManager: F2FManager | null = null;
-  private rtcGroupManager: RtcGroupManager | null = null;
+  private mesh: MeshManager;
+  readonly mode: NetworkMode = 'f2f';
 
   onEvent: ((ev: NetworkEvent) => void) | null = null;
 
   constructor(opts: NetworkManagerOptions) {
-    this.currentMode = opts.mode;
-    this.privKeyHex = opts.privKeyHex;
-    this.relayClients = opts.relayClients;
-    this.seedRelayUrl = opts.seedRelayUrl;
-    if (this.privKeyHex) {
-      this.initCurrentMode();
-    }
-  }
-
-  private initCurrentMode() {
-    if (!this.privKeyHex) return;
-    switch (this.currentMode) {
-      case 'f2f':
-        this.initF2F();
-        break;
-      case 'rtcgroup':
-        this.initRtcGroup();
-        break;
-      case 'relay':
-      default:
-        break;
-    }
-  }
-
-  private initF2F() {
-    this.f2fManager = new F2FManager({
-      privKeyHex: this.privKeyHex,
-      relays: this.relayClients,
-      seedRelayUrl: this.seedRelayUrl,
-    });
-    this.f2fManager.onEvent = (ev) => {
+    this.mesh = new MeshManager(opts);
+    this.mesh.onEvent = (ev) => {
       this.onEvent?.({ ...ev, mode: 'f2f' });
     };
-    // F2F モード開始時にシード登録 (自分の情報をリレーに通知)
-    this.f2fManager.registerSeed?.().catch(() => {});
-  }
-
-  private initRtcGroup() {
-    this.rtcGroupManager = new RtcGroupManager({
-      privKeyHex: this.privKeyHex,
-      relays: this.relayClients,
-    });
-    this.rtcGroupManager.onEvent = (ev) => {
-      this.onEvent?.({ ...ev, mode: 'rtcgroup' });
-    };
-    this.rtcGroupManager.subscribeKnownGroups();
-  }
-
-  private async cleanupCurrentMode() {
-    if (this.f2fManager) {
-      this.f2fManager.close();
-      this.f2fManager = null;
-    }
-    if (this.rtcGroupManager) {
-      this.rtcGroupManager.close();
-      this.rtcGroupManager = null;
-    }
   }
 
   getPeerCount(): number {
-    if (this.f2fManager) return this.f2fManager.peerCount;
-    if (this.rtcGroupManager) return this.rtcGroupManager.peerCount;
-    return 0;
-  }
-
-  getGroups(): (F2FGroupInfo | RtcGroupInfo)[] {
-    if (this.f2fManager) return this.f2fManager.getGroups();
-    if (this.rtcGroupManager) return this.rtcGroupManager.getGroups();
-    return [];
+    return this.mesh.peerCount;
   }
 
   getMode(): NetworkMode {
-    return this.currentMode;
+    return this.mode;
   }
 
-  async setMode(mode: NetworkMode) {
-    if (mode === this.currentMode) return;
-    await this.cleanupCurrentMode();
-    this.currentMode = mode;
-    this.initCurrentMode();
+  bootstrap(): Promise<boolean> {
+    return this.mesh.bootstrap();
+  }
+
+  createInvitation(targetPubkeyHex?: string, expiresInSec?: number, scope?: number): Promise<string> {
+    return this.mesh.createInvitation(targetPubkeyHex, expiresInSec, scope);
+  }
+
+  connectWithInvitation(code: string): Promise<boolean> {
+    return this.mesh.connectWithInvitation(code);
+  }
+
+  async broadcastEvent(event: Parameters<MeshManager['broadcastEvent']>[0]): Promise<boolean> {
+    return this.mesh.broadcastEvent(event);
+  }
+
+  getPeerCache() {
+    return this.mesh.getPeerCache();
+  }
+
+  getDhtNodes() {
+    return this.mesh.getDhtNodes();
+  }
+
+  getTrustEntries() {
+    return this.mesh.getTrustEntries();
+  }
+
+  getLocalEvents() {
+    return this.mesh.getLocalEvents();
   }
 
   close() {
-    this.cleanupCurrentMode();
+    this.mesh.close();
   }
 }
 
@@ -147,3 +105,9 @@ export function pubkeyToFpub(pubkeyHex: string): string {
   const pubBytes = CryptoUtils.hexToBytes(pubkeyHex);
   return CryptoUtils.fpubEncode(pubBytes).toLowerCase();
 }
+
+export { MeshManager };
+export type { MeshEvent } from './f2fMesh';
+export type { F2FPeerInfo } from './fodprF2f';
+export type { DhtNodeInfo } from './dht';
+export type { TrustEntry } from './wot';

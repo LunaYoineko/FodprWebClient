@@ -2,20 +2,14 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode }
 import { createPortal } from 'react-dom';
 import {
   Protocol,
-  TransTypeAll,
   TransTypeBinary,
   TransTypeJSON,
   TransTypeString,
-  DelTargetEvent,
-  type FodprDelReq,
   type FodprEvent,
-  type FodprReq,
 } from '@fodpr/protocol';
 import { CryptoUtils } from '@fodpr/crypto';
 import '@dpawlikowski/liquid-glass/css';
 import { LiquidGlass } from '@dpawlikowski/liquid-glass/react';
-import type { RelayMessage } from './lib/relay';
-import { sha256 } from '@noble/hashes/sha2.js';
 import { fsecToHex, hexToFsec } from './lib/bech32';
 import {
   clearSecret,
@@ -26,7 +20,6 @@ import {
   saveSecret,
   saveNostrSecret,
 } from './lib/keystore';
-import { useRelay, type RelayStatus } from './hooks/useRelay';
 import {
   getPublicKeyFromSecret,
   hexToNpub,
@@ -68,16 +61,9 @@ import {
   type CustomEmojiDef,
 } from './lib/customEmoji';
 import { SteganographyText } from './lib/steganography';
-import { type F2FGroupInfo, type F2FPeerInfo } from './lib/fodprF2f';
-import { createNetworkManager, type NetworkManager, type NetworkMode, type RtcGroupInfo } from './lib/network';
-
-// 既定の接続先リレー(設定画面から追加・削除可能)
-const DEFAULT_RELAYS = [
-  'wss://fodpr-relay.yoinekodo.jp/',
-  'wss://fodpr-subrelay.yoinekodo.jp/'
-];
-const RELAYS_STORAGE_KEY = 'fodpr_relays';
-const NETWORK_MODE_STORAGE_KEY = 'fodpr_network_mode';
+import type { F2FPeerInfo } from './lib/network';
+import { createNetworkManager, type NetworkManager, type MeshEvent } from './lib/network';
+import { loadBootstrapNodes, saveBootstrapNodes } from './lib/f2fMesh';
 
 // 既定の Nostr リレー(設定画面から追加・削除可能)
 const DEFAULT_NOSTR_RELAYS = ['wss://relay.yoinekodo.jp/'];
@@ -288,23 +274,6 @@ function nostrImageUrls(e: NostrEvent): { url: string; mime?: string }[] {
 function inlineImageUrls(content: string): string[] {
   const IMG_URL_RE = /https?:\/\/[^\s<>"]+\.(?:png|jpe?g|gif|webp|avif|bmp)(?:\?[^\s<>"]*)?/gi;
   return [...content.matchAll(IMG_URL_RE)].map((m) => m[0]);
-}
-
-// リレー一覧を localStorage から読み込む(不正な値は既定値へフォールバック)
-function loadRelays(): string[] {
-  const raw = localStorage.getItem(RELAYS_STORAGE_KEY);
-  if (raw) {
-    try {
-      const arr = JSON.parse(raw);
-      if (Array.isArray(arr)) {
-        const urls = arr.filter((x): x is string => typeof x === 'string' && /^wss?:\/\//.test(x));
-        if (urls.length > 0) return urls;
-      }
-    } catch {
-      /* 壊れていれば既定値へ */
-    }
-  }
-  return [...DEFAULT_RELAYS];
 }
 
 // pubkey hex をキーにしてイベントを一意化する(サーバー再送信・自投稿の重複を避ける)
@@ -1371,11 +1340,6 @@ function App() {
     }
   }
 
-  // 接続先リレー(複数・設定画面から変更可能)
-  const [relayUrls, setRelayUrls] = useState<string[]>(loadRelays);
-  const relayUrlsKey = relayUrls.join('\n');
-  const relay = useRelay(relayUrls);
-
   // Nostr リレー(複数・Nostr タブの設定画面から変更可能)
   const [nostrRelayUrls, setNostrRelayUrls] = useState<string[]>(loadNostrRelays);
   const nostrRelay = useNostrRelay(nostrRelayUrls);
@@ -1495,48 +1459,37 @@ function App() {
 const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
 
     // ────────────────────────────────────────────────────────────────────────
-    // 統合ネットワーク層 (F2F / Relay / RtcGroup)
+    // 統合ネットワーク層 (v0.6 メッシュ: F2F のみ)
     // ────────────────────────────────────────────────────────────────────────
-    const [networkMode, setNetworkMode] = useState<NetworkMode>(() => {
-      try {
-        return (localStorage.getItem(NETWORK_MODE_STORAGE_KEY) as NetworkMode) || 'relay';
-      } catch {
-        return 'relay';
-      }
-    });
     const [networkPeerCount, setNetworkPeerCount] = useState(0);
-    const [networkGroups, setNetworkGroups] = useState<(F2FGroupInfo | RtcGroupInfo)[]>([]);
-    const [networkLastError, setNetworkLastError] = useState<string | null>(null);
     const [networkSeedNodes, setNetworkSeedNodes] = useState<F2FPeerInfo[]>([]);
+    const [networkLastError, setNetworkLastError] = useState<string | null>(null);
     const [networkBootstrapDone, setNetworkBootstrapDone] = useState(false);
     const [invitationCode, setInvitationCode] = useState<string | null>(null);
+    const [meshTrust, setMeshTrust] = useState<{ pubkey: string; score: number; lastSeen: number; introducedBy?: string }[]>([]);
+    const [meshDhtNodes, setMeshDhtNodes] = useState<F2FPeerInfo[]>([]);
+    const [meshReceivedEvents, setMeshReceivedEvents] = useState<FodprEvent[]>([]);
 
     const networkManagerRef = useRef<NetworkManager | null>(null);
 
-    function setNetworkModePersisted(next: NetworkMode) {
-      setNetworkMode(next);
-      try {
-        localStorage.setItem(NETWORK_MODE_STORAGE_KEY, next);
-      } catch {
-        /* ignore */
-      }
-    }
-
     useEffect(() => {
-      const mgr = createNetworkManager({
-        mode: networkMode,
-        privKeyHex: privKey ?? '',
-        relayClients: Array.from(relay.clients.values()),
-        seedRelayUrl: relayUrls[0],
-      });
+      if (!privKey) {
+        networkManagerRef.current?.close();
+        networkManagerRef.current = null;
+        return;
+      }
+      const mgr = createNetworkManager({ privKeyHex: privKey });
 
-      mgr.onEvent = (ev) => {
+      mgr.onEvent = (ev: MeshEvent) => {
         if (ev.type === 'peer_connected' || ev.type === 'peer_disconnected') {
           setNetworkPeerCount(mgr.getPeerCount());
-        } else if (ev.type === 'group_updated' || ev.type === 'group_joined') {
-          setNetworkGroups(mgr.getGroups());
-        } else if (ev.type === 'seed_nodes') {
-          setNetworkSeedNodes(ev.nodes);
+        } else if (ev.type === 'seed_nodes' || ev.type === 'peer_list_received' || ev.type === 'wot_intro_received') {
+          setNetworkSeedNodes(mgr.getPeerCache());
+        } else if (ev.type === 'event_received') {
+          setMeshReceivedEvents((prev) => {
+            if (prev.some((e) => dedupeKey(e) === dedupeKey(ev.event))) return prev;
+            return [...prev, ev.event];
+          });
         } else if (ev.type === 'error') {
           setNetworkLastError(ev.message);
         }
@@ -1544,80 +1497,69 @@ const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
 
       networkManagerRef.current = mgr;
       setNetworkPeerCount(mgr.getPeerCount());
-      setNetworkGroups(mgr.getGroups());
+      setNetworkSeedNodes(mgr.getPeerCache());
+      setMeshTrust(mgr.getTrustEntries());
+      setMeshDhtNodes(mgr.getDhtNodes());
       setInvitationCode(null);
+
+      // 接続可能なブートストラップノードへ自動ダイアル
+      mgr.bootstrap().then((ok) => {
+        setNetworkBootstrapDone(ok);
+        setNetworkPeerCount(mgr.getPeerCount());
+        setNetworkSeedNodes(mgr.getPeerCache());
+        setMeshDhtNodes(mgr.getDhtNodes());
+      });
 
       return () => {
         mgr.close();
       };
-    }, [networkMode, privKey, relayUrlsKey]);
+    }, [privKey]);
 
     async function handleNetworkBootstrap() {
       const mgr = networkManagerRef.current;
-      if (!mgr || networkMode !== 'f2f') return;
-      // F2FManager の bootstrap を呼ぶには cast が必要
-      const f2fMgr = mgr as any;
-      if (typeof f2fMgr.bootstrap === 'function') {
-        setNetworkBootstrapDone(false);
-        const ok = await f2fMgr.bootstrap();
-        if (ok) setNetworkBootstrapDone(true);
-      }
-    }
-
-    async function handleNetworkCreateGroup() {
-      const mgr = networkManagerRef.current;
       if (!mgr) return;
-      if (networkMode === 'f2f') {
-        const f2fMgr = mgr as any;
-        if (typeof f2fMgr.createGroup === 'function') {
-          const group = f2fMgr.createGroup();
-          setNetworkGroups(mgr.getGroups());
-          setNetworkLastError(null);
-          return group;
-        }
-      } else if (networkMode === 'rtcgroup') {
-        const rtgMgr = mgr as any;
-        if (typeof rtgMgr.createGroup === 'function') {
-          const group = rtgMgr.createGroup();
-          setNetworkGroups(mgr.getGroups());
-          setNetworkLastError(null);
-          return group;
-        }
-      }
-    }
-
-    async function handleNetworkJoinGroup(groupId: string) {
-      const mgr = networkManagerRef.current;
-      if (!mgr || networkMode !== 'rtcgroup') return;
-      const rtgMgr = mgr as any;
-      if (typeof rtgMgr.joinGroup === 'function') {
-        const group = rtgMgr.joinGroup(groupId);
-        setNetworkGroups(mgr.getGroups());
-        setNetworkLastError(null);
-        return group;
+      setNetworkBootstrapDone(false);
+      try {
+        const ok = await mgr.bootstrap();
+        setNetworkBootstrapDone(ok);
+        setNetworkPeerCount(mgr.getPeerCount());
+        setNetworkSeedNodes(mgr.getPeerCache());
+        setMeshDhtNodes(mgr.getDhtNodes());
+      } catch (e) {
+        setNetworkLastError(e instanceof Error ? e.message : 'ブートストラップ失敗');
       }
     }
 
     async function handleNetworkCreateInvitation() {
       const mgr = networkManagerRef.current;
-      if (!mgr || networkMode !== 'f2f') return;
-      const f2fMgr = mgr as any;
-      if (typeof f2fMgr.createInvitation === 'function') {
-        const code = await f2fMgr.createInvitation();
+      if (!mgr) return;
+      try {
+        const code = await mgr.createInvitation();
         setInvitationCode(code);
+        setNetworkLastError(null);
+      } catch (e) {
+        setNetworkLastError(e instanceof Error ? e.message : '招待コード生成失敗');
       }
     }
 
     async function handleNetworkConnectInvitation(code: string) {
       const mgr = networkManagerRef.current;
-      if (!mgr || networkMode !== 'f2f') return;
-      const f2fMgr = mgr as any;
-      if (typeof f2fMgr.connectWithInvitation === 'function') {
-        await f2fMgr.connectWithInvitation(code);
+      if (!mgr) return;
+      try {
+        await mgr.connectWithInvitation(code);
+        setNetworkPeerCount(mgr.getPeerCount());
+        setNetworkSeedNodes(mgr.getPeerCache());
+        setMeshDhtNodes(mgr.getDhtNodes());
+        setNetworkLastError(null);
+      } catch (e) {
+        setNetworkLastError(e instanceof Error ? e.message : '招待コード接続失敗');
       }
     }
 
-   // ミュート中の pubkey(Fodpr / Nostr 共通、localStorage 永続化)
+    // メッシュが少なくとも1つのピアに接続中か (リレー接続状態の代替)
+    const meshConnected = networkPeerCount > 0;
+
+    // ミュート中の pubkey(Fodpr / Nostr 共通、localStorage 永続化)
    const [mutedPubkeys, setMutedPubkeys] = useState<Set<string>>(loadMutedPubkeys);
    function toggleMute(pubkeyHex: string) {
      setMutedPubkeys((prev) => {
@@ -1750,14 +1692,8 @@ const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
     };
   }, []);
 
-  // 受信 PUSH イベント(各リレーから)を型付きで取り出す
-  const receivedEvents = useMemo(
-    () =>
-      relay.messages.filter(
-        (m): m is Extract<RelayMessage, { kind: 'event' }> => m.kind === 'event',
-      ).map((m) => m.event),
-    [relay.messages],
-  );
+  // メッシュでゴシップ受信したイベント
+  const receivedEvents = meshReceivedEvents;
 
   // サーバー受信 + 自投稿をマージ(重複排除)してフィードのソースにする。
   // 削除済みのイベントはここで除外する。
@@ -1780,6 +1716,29 @@ const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
     }
     return merged.filter((e) => !deletedKeys.has(dedupeKey(e)));
   }, [receivedEvents, localEvents, deletedKeys]);
+
+  // メッシュでゴシップ配信されたタンプコーン(削除告知)を処理する。
+  // タンプコーンイベントの content は JSON {"tombstone": "<dedupeKey>"}。
+  // 受信次第、対象の dedupeKey を deletedKeys へ加える (フィードから除外)。
+  useEffect(() => {
+    for (const e of receivedEvents) {
+      if (!e.tags.includes('tombstone')) continue;
+      let targetKey: string | null = null;
+      try {
+        const obj = JSON.parse(new TextDecoder().decode(e.content));
+        if (obj && typeof obj.tombstone === 'string') targetKey = obj.tombstone;
+      } catch {
+        /* 無視 */
+      }
+      if (!targetKey) {
+        const t = e.tags.find((t) => t.startsWith('tombstone:'));
+        if (t) targetKey = t.split(':').slice(1).join(':');
+      }
+      if (targetKey) {
+        setDeletedKeys((prev) => (prev.has(targetKey) ? prev : new Set(prev).add(targetKey)));
+      }
+    }
+  }, [receivedEvents]);
 
   const { profiles, notes, binaries, reactions, replies, links, others } = useMemo(
     () => splitEvents(allEvents),
@@ -2269,113 +2228,11 @@ const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
       if (post) setNotifPost({ post, source: 'nostr' });
     }
   }
-
-  // 接続確立後に一度 REQ(All) して保存済みイベントを取得する(再接続・リレー変更時にも再送)
-  useEffect(() => {
-    let done = false;
-    if (!relay.connected) return;
-    const req: FodprReq = { subId: 'sub_web_' + Date.now(), transType: TransTypeAll, tagKey: '', tagVal: '' };
-    const t = setTimeout(() => {
-      if (done) return;
-      try {
-        relay.sendReq(req);
-      } catch {
-        /* 未接続中は無視 */
-      }
-    }, 300);
-    return () => {
-      done = true;
-      clearTimeout(t);
-    };
-  }, [relayUrlsKey, relay.connected, relay.sendReq]);
-
   // ────────────────────────────────────────────────────────────────────────
-  // 削除の他端末への反映
-  // リレーは DEL を購読者へブロードキャストしないため、定期的に REQ(All) を
-  // 張り直して「以前にあったのに今は無いイベント = 他端末で削除された」を検出する。
+  // 削除の他端端末への反映 (v0.6 メッシュ)
+  // メッシュでは DEL をブロードキャストせず、削除対象をタンプコーン(tombstone)
+  // イベントで伝播する。削除済みイベントの dedupeKey 集合 (deletedKeys) は維持する。
   // ────────────────────────────────────────────────────────────────────────
-  const knownKeysRef = useRef<Set<string>>(new Set());
-  const liveKeysRef = useRef<Set<string>>(new Set());
-  const syncSubRef = useRef<string | null>(null);
-  const localEventsRef = useRef<FodprEvent[]>([]);
-  // relay.messages は React 18 の自動バッチングで1回のコミットに複数のメッセージが
-  // まとめられることがあるため、前回効果を処理してから到達したインデックスを保持して
-  // 逐一すべてのメッセージを走査する(直近1件のみ見るとイベントが見落とされる)
-  const syncMsgIdxRef = useRef(0);
-  useEffect(() => {
-    localEventsRef.current = localEvents;
-  }, [localEvents]);
-
-  // 受信・自投稿イベントを「これまでに見た鍵」へ記録する
-  useEffect(() => {
-    const seen = knownKeysRef.current;
-    for (const e of receivedEvents) seen.add(dedupeKey(e));
-    for (const e of localEvents) seen.add(dedupeKey(e));
-  }, [receivedEvents, localEvents]);
-
-  function startSyncReq() {
-    if (!relay.connected) return;
-    if (syncSubRef.current) return;
-    const subId = 'sync_' + Date.now();
-    syncSubRef.current = subId;
-    liveKeysRef.current = new Set();
-    try {
-      relay.sendReq({ subId, transType: TransTypeAll, tagKey: '', tagVal: '' });
-    } catch {
-      syncSubRef.current = null;
-    }
-  }
-
-  // 接続直後(5秒後)と定期的(30秒ごと)に再同期して他端末の削除を反映する
-  useEffect(() => {
-    if (!relay.connected) return;
-    const t = setTimeout(startSyncReq, 5000);
-    return () => clearTimeout(t);
-  }, [relay.connected]);
-  useEffect(() => {
-    const t = setInterval(startSyncReq, 30000);
-    return () => clearInterval(t);
-  }, [relay.connected]);
-
-  // EOE を受け取ったら「既知 − 現在生きている鍵」= 削除済みを deletedKeys へ加える
-  useEffect(() => {
-    const msgs = relay.messages;
-    const syncId = syncSubRef.current;
-    // 前回この効果が走った時点からの新規メッセージをすべて処理する(バッチによる途中経過の吸過)
-    for (let i = syncMsgIdxRef.current; i < msgs.length; i++) {
-      const m = msgs[i];
-      if (!syncId) break;
-      if (m.kind === 'event' && m.subId === syncId) {
-        liveKeysRef.current.add(dedupeKey(m.event));
-      } else if (
-        m.kind === 'text' &&
-        m.text.startsWith('EOE:') &&
-        m.text.includes(syncId)
-      ) {
-        const live = liveKeysRef.current;
-        for (const e of localEventsRef.current) live.add(dedupeKey(e));
-        const deleted = new Set<string>();
-        for (const k of knownKeysRef.current) {
-          if (!live.has(k)) deleted.add(k);
-        }
-        if (deleted.size > 0) {
-          setDeletedKeys((prev) => {
-            const next = new Set(prev);
-            for (const k of deleted) next.add(k);
-            return next;
-          });
-        }
-        knownKeysRef.current = live;
-        liveKeysRef.current = new Set();
-        syncSubRef.current = null;
-        // この EOE でサブスクリプションは終了したので、それ以降のメッセージは
-        // 次の sync 用に無視してカーソルだけ進める
-        break;
-      }
-    }
-    syncMsgIdxRef.current = msgs.length;
-  }, [relay.messages]);
-
   // Nostr リレー接続後に kind 0/1/5/6/7 を購読する。
   // NIP-65 の read マーカーがあれば read リレーだけから読み込む。
   // 初回は直近ウィンドウを小さく取得して UI を早く立ち上げ、その後に過去分を
@@ -2516,7 +2373,8 @@ const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
     }
   }
 
-  // 署名済みイベントを全リレーへ送信する
+  // 署名済みイベントをメッシュへゴシップブロードキャストする (v0.6)
+  // Optimistic: 自フィードに即反映
   function sendSignedEvent(transType: number, content: string, signatureHex: string, tags: string[] = []) {
     const event: FodprEvent = {
       transType,
@@ -2526,14 +2384,20 @@ const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
       content: new TextEncoder().encode(content),
       signature: CryptoUtils.hexToBytes(signatureHex),
     };
-    // Optimistic: 自フィードに即反映
     setLocalEvents((prev) => [event, ...prev]);
-    relay.sendEvent(event);
+    const mgr = networkManagerRef.current;
+    if (mgr) {
+      mgr.broadcastEvent(event).catch(() => {
+        /* 未接続中は送信できない。再接続後のメッシュ同期で自イベントも取得できる */
+      });
+    }
   }
 
-  // イベントを削除する(DEL メッセージを送信)
+  // イベントを削除する。メッシュでは DEL をブロードキャストせず、タンプコーン
+  // (削除告知) イベントをゴシップで伝播する。他端末がタンプコーンを受信すると
+  // 同じ dedupeKey を deletedKeys へ加える。
   async function deleteEvent(_targetKey: string, targetEvent: FodprEvent) {
-    if (!privKey || !relay.connected) return;
+    if (!privKey) return;
 
     // 削除対象の公開鍵と自分の鍵が一致するか確認
     const targetPubkeyHex = CryptoUtils.bytesToHex(targetEvent.pubkey);
@@ -2543,25 +2407,25 @@ const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
       return;
     }
 
-    // DEL 要求を組み立てる(署名対象は Protocol.encodeDelSignedData が生成)
-    const delReq: FodprDelReq = {
-      transType: targetEvent.transType,
-      targetType: DelTargetEvent,
-      pubkey: targetEvent.pubkey,
-      createdAt: targetEvent.createdAt,
-      contentHash: new Uint8Array(sha256(targetEvent.content)),
-      eventId: new Uint8Array(),
-      signature: new Uint8Array(),
+    const key = dedupeKey(targetEvent);
+    const tombstone: FodprEvent = {
+      transType: TransTypeJSON,
+      createdAt: Math.floor(Date.now() / 1000),
+      pubkey: pubkeyBytes,
+      tags: ['tombstone'],
+      content: new TextEncoder().encode(JSON.stringify({ tombstone: key })),
+      signature: new Uint8Array(64),
     };
-    const signedData = Protocol.encodeDelSignedData(delReq);
+    const signedData = Protocol.encodeEventSignedDataForSig(tombstone);
     const sigHex = await CryptoUtils.signMessage(privKey, signedData);
-    delReq.signature = CryptoUtils.hexToBytes(sigHex);
+    tombstone.signature = CryptoUtils.hexToBytes(sigHex);
 
-    // 送信 (relay.sendDel が MsgTypeDel(0x03) 付きパケットを送信する)
     try {
-      relay.sendDel(delReq);
+      const mgr = networkManagerRef.current;
+      if (mgr) {
+        await mgr.broadcastEvent(tombstone);
+      }
       // Optimistic: ローカル + 受信済みを問わずフィードから削除
-      const key = dedupeKey(targetEvent);
       setDeletedKeys((prev) => new Set(prev).add(key));
       setLocalEvents((prev) => prev.filter((e) => dedupeKey(e) !== key));
     } catch (e) {
@@ -2755,14 +2619,14 @@ const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
   // 対象イベントへリアクション(絵文字)を投稿する。
   // content=リアクション、tags=[react:<対象の dedupeKey>] の TransTypeString として送る。
   async function handleReact(targetKey: string, emoji: string) {
-    if (!privKey || !relay.connected) return;
+    if (!privKey || !meshConnected) return;
     const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(emoji));
     sendSignedEvent(TransTypeString, emoji, sig, [`react:${targetKey}`]);
   }
 
   // リポスト: content=空、tags=[repost:<対象の dedupeKey>] の TransTypeString として送る
   async function handleRepost(targetKey: string) {
-    if (!privKey || !relay.connected) return;
+    if (!privKey || !meshConnected) return;
     const sig = await CryptoUtils.signMessage(privKey, new TextEncoder().encode(''));
     sendSignedEvent(TransTypeString, '', sig, [`repost:${targetKey}`]);
   }
@@ -3210,12 +3074,6 @@ const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
     setLocalEvents([]);
   }
 
-  // リレー一覧を更新して保存する
-  function updateRelays(urls: string[]) {
-    setRelayUrls(urls);
-    localStorage.setItem(RELAYS_STORAGE_KEY, JSON.stringify(urls));
-  }
-
   // 復号ロード中はローディング画面
   if (!ready) {
     return (
@@ -3403,7 +3261,7 @@ const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
                         name={selfName}
                         className="h-6 w-6 text-xs"
                       />
-                      <span className={'h-2 w-2 rounded-full ' + (relay.connected ? 'bg-green-400' : 'bg-red-400')} />
+                      <span className={'h-2 w-2 rounded-full ' + (meshConnected ? 'bg-green-400' : 'bg-red-400')} />
                       <span className="hidden font-medium text-white sm:inline">{selfName}</span>
                     </>
                   ) : (
@@ -3495,7 +3353,7 @@ const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
                         onCancelReply={() => setReplyTarget(null)}
                         onPickFile={onPickFile}
                         onSubmit={postNote}
-                        relayConnected={relay.connected}
+                        relayConnected={meshConnected}
                         mediaType={mediaType}
                         mediaThumbnail={mediaThumbnail}
                         emojis={pickerEmojis}
@@ -3570,43 +3428,37 @@ const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
                   onNameChange={setName}
                   onAboutChange={setAbout}
                   onSave={postProfile}
-                  relayConnected={relay.connected}
+                  relayConnected={meshConnected}
                   nostrLoggedIn={!!nostrPrivKey || !!nostrNip07Pubkey}
                   onNostrImport={handleNostrImport}
                 />
               )}
-              {view === 'settings' && (
-                <SettingsView
-                  relayUrls={relayUrls}
-                  onRelayChange={updateRelays}
-                  relayStatus={relay.relayStatus}
-                  relayConnected={relay.connected}
-                  onLogout={handleLogout}
-                  onShowDocs={openDocs}
-                  secretHex={privKey}
-                  browserNotifEnabled={browserNotifEnabled}
-                  notifPermission={notifPermission}
-                  onToggleBrowserNotif={setBrowserNotifsEnabled}
-                  onRequestNotifPermission={requestNotificationPermission}
-                  mutedPubkeys={mutedPubkeys}
-                  onToggleMute={toggleMute}
-                  profileMap={profileMap}
-                  networkMode={networkMode}
-                  onSetNetworkMode={setNetworkModePersisted}
-                  networkPeerCount={networkPeerCount}
-                  networkGroups={networkGroups}
-                  networkLastError={networkLastError}
-                  networkBootstrapDone={networkBootstrapDone}
-                  onNetworkBootstrap={handleNetworkBootstrap}
-                  onNetworkCreateGroup={handleNetworkCreateGroup}
-                  onNetworkJoinGroup={handleNetworkJoinGroup}
-                  onNetworkCreateInvitation={handleNetworkCreateInvitation}
-                  onNetworkConnectInvitation={handleNetworkConnectInvitation}
-                  networkSeedNodes={networkSeedNodes}
-                  invitationCode={invitationCode}
-                  setInvitationCode={setInvitationCode}
-                />
-              )}
+               {view === 'settings' && (
+                 <SettingsView
+                   onLogout={handleLogout}
+                   onShowDocs={openDocs}
+                   secretHex={privKey}
+                   browserNotifEnabled={browserNotifEnabled}
+                   notifPermission={notifPermission}
+                   onToggleBrowserNotif={setBrowserNotifsEnabled}
+                   onRequestNotifPermission={requestNotificationPermission}
+                   mutedPubkeys={mutedPubkeys}
+                   onToggleMute={toggleMute}
+                   profileMap={profileMap}
+                   meshConnected={meshConnected}
+                   networkPeerCount={networkPeerCount}
+                   networkLastError={networkLastError}
+                   networkBootstrapDone={networkBootstrapDone}
+                   onNetworkBootstrap={handleNetworkBootstrap}
+                   onNetworkCreateInvitation={handleNetworkCreateInvitation}
+                   onNetworkConnectInvitation={handleNetworkConnectInvitation}
+                   networkSeedNodes={networkSeedNodes}
+                   meshTrust={meshTrust}
+                   meshDhtNodes={meshDhtNodes}
+                   invitationCode={invitationCode}
+                   setInvitationCode={setInvitationCode}
+                 />
+               )}
             </>
           ) : (
             <>
@@ -3768,7 +3620,7 @@ const notifWatermarkRef = useRef(Math.floor(Date.now() / 1000));
                       onCancelReply={() => setReplyTarget(null)}
                       onPickFile={onPickFile}
                       onSubmit={postNote}
-                      relayConnected={relay.connected}
+                      relayConnected={meshConnected}
                       mediaType={mediaType}
                       mediaThumbnail={mediaThumbnail}
                       emojis={pickerEmojis}
@@ -6655,13 +6507,21 @@ function MuteListCard({
    設定
    ──────────────────────────────────────────────────────────────────── */
 function SettingsView({
-  relayUrls,
-  onRelayChange,
-  relayStatus,
-  relayConnected,
+  meshConnected,
+  networkPeerCount,
+  networkLastError,
+  networkBootstrapDone,
+  onNetworkBootstrap,
+  onNetworkCreateInvitation,
+  onNetworkConnectInvitation,
+  networkSeedNodes,
+  meshTrust,
+  meshDhtNodes,
+  invitationCode,
+  setInvitationCode: _setInvitationCode,
   onLogout,
   onShowDocs,
-   secretHex,
+  secretHex,
   browserNotifEnabled,
   notifPermission,
   onToggleBrowserNotif,
@@ -6669,25 +6529,19 @@ function SettingsView({
   mutedPubkeys,
   onToggleMute,
   profileMap,
-  networkMode,
-  onSetNetworkMode,
-  networkPeerCount,
-  networkGroups,
-  networkLastError,
-  networkBootstrapDone,
-  onNetworkBootstrap,
-  onNetworkCreateGroup,
-  onNetworkJoinGroup,
-  onNetworkCreateInvitation,
-  onNetworkConnectInvitation,
-  networkSeedNodes,
-  invitationCode,
-  setInvitationCode: _setInvitationCode,
 }: {
-  relayUrls: string[];
-  onRelayChange: (urls: string[]) => void;
-  relayStatus: RelayStatus[];
-  relayConnected: boolean;
+  meshConnected: boolean;
+  networkPeerCount: number;
+  networkLastError: string | null;
+  networkBootstrapDone: boolean;
+  onNetworkBootstrap: () => void;
+  onNetworkCreateInvitation: () => Promise<void>;
+  onNetworkConnectInvitation: (code: string) => Promise<void>;
+  networkSeedNodes: F2FPeerInfo[];
+  meshTrust: { pubkey: string; score: number; lastSeen: number; introducedBy?: string }[];
+  meshDhtNodes: F2FPeerInfo[];
+  invitationCode: string | null;
+  setInvitationCode: (code: string | null) => void;
   onLogout: () => void;
   onShowDocs: () => void;
   secretHex: string | null;
@@ -6698,22 +6552,9 @@ function SettingsView({
   mutedPubkeys: Set<string>;
   onToggleMute: (pubkeyHex: string) => void;
   profileMap: Record<string, FodprEvent>;
-  networkMode: NetworkMode;
-  onSetNetworkMode: (mode: NetworkMode) => void;
-  networkPeerCount: number;
-  networkGroups: (F2FGroupInfo | RtcGroupInfo)[];
-  networkLastError: string | null;
-  networkBootstrapDone: boolean;
-  onNetworkBootstrap: () => void;
-  onNetworkCreateGroup: () => void;
-  onNetworkJoinGroup: (groupId: string) => void;
-  onNetworkCreateInvitation: () => Promise<void>;
-  onNetworkConnectInvitation: (code: string) => Promise<void>;
-  networkSeedNodes: F2FPeerInfo[];
-  invitationCode: string | null;
-  setInvitationCode: (code: string | null) => void;
 }) {
-  const [relayInput, setRelayInput] = useState('');
+  const [bootstrapInput, setBootstrapInput] = useState('');
+  const [invitationInput, setInvitationInput] = useState('');
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -6721,29 +6562,26 @@ function SettingsView({
   const fsec = useMemo(() => (secretHex ? hexToFsec(secretHex) : ''), [secretHex]);
   const masked = fsec.length > 16 ? `${fsec.slice(0, 9)}…${fsec.slice(-6)}` : fsec;
 
-  function addRelay() {
-    const url = relayInput.trim();
-    if (!/^wss?:\/\//.test(url)) {
-      setErr('wss:// または ws:// で始まるURLを入力してください');
+  function addBootstrapNode() {
+    const url = bootstrapInput.trim();
+    if (!/^fpub1@\[.*\]:\d+$/i.test(url)) {
+      setErr('fpub1@[ipv6]:port 形式で入力してください');
       return;
     }
-    if (relayUrls.includes(url)) {
-      setErr('そのリレーは既に登録されています');
+    const nodes = loadBootstrapNodes();
+    if (nodes.includes(url)) {
+      setErr('そのブートストラップノードは既に登録されています');
       return;
     }
-    onRelayChange([...relayUrls, url]);
-    setRelayInput('');
-    setMsg('リレーを追加しました');
+    saveBootstrapNodes([...nodes, url]);
+    setMsg('ブートストラップノードを追加しました');
     setErr(null);
   }
 
-  function removeRelay(url: string) {
-    if (relayUrls.length <= 1) {
-      setErr('最後のリレーは削除できません');
-      return;
-    }
-    onRelayChange(relayUrls.filter((u) => u !== url));
-    setMsg('リレーを削除しました');
+  function removeBootstrapNode(url: string) {
+    const nodes = loadBootstrapNodes();
+    saveBootstrapNodes(nodes.filter((u) => u !== url));
+    setMsg('ブートストラップノードを削除しました');
     setErr(null);
   }
 
@@ -6809,259 +6647,168 @@ function SettingsView({
               </p>
             )}
           </div>
-
-          <div className="space-y-2">
-            <label className="block text-xs text-gray-400">接続リレー (複数登録可)</label>
-            <div className="space-y-2">
-              {relayStatus.map((s) => (
-                <div key={s.url} className="flex items-center gap-2 rounded-xl bg-black/30 px-3 py-2">
-                  <span className={'h-2 w-2 shrink-0 rounded-full ' + (s.connected ? 'bg-green-400' : 'bg-red-400')} />
-                  <span className="min-w-0 flex-1 truncate text-xs text-gray-300">{s.url}</span>
-                  <button
-                    onClick={() => removeRelay(s.url)}
-                    disabled={relayUrls.length <= 1}
-                    className="shrink-0 rounded-lg border border-white/15 px-2 py-1 text-xs text-gray-400 transition-colors hover:bg-white/10 disabled:opacity-30"
-                  >
-                    削除
-                  </button>
-                </div>
-              ))}
-            </div>
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                placeholder="wss://example-relay/"
-                value={relayInput}
-                onChange={(e) => setRelayInput(e.target.value)}
-                className="min-w-0 flex-1 rounded-xl bg-black/30 px-3 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-white/25"
-              />
-              <button
-                onClick={addRelay}
-                className="shrink-0 rounded-xl bg-primary px-4 py-2 text-sm font-semibold text-bg transition-colors hover:bg-primary-hover"
-              >
-                追加
-              </button>
-            </div>
-            <div className="flex items-center justify-between">
-              <span className={'flex items-center gap-1.5 text-xs ' + (relayConnected ? 'text-green-400' : 'text-red-400')}>
-                <span className={'h-2 w-2 rounded-full ' + (relayConnected ? 'bg-green-400' : 'bg-red-400')} />
-                いずれかのリレーに接続中
-              </span>
-            </div>
-          </div>
-
-          <div className="space-y-1 border-t border-white/10 pt-4 text-xs text-gray-400">
-            <p>投稿は登録済みの全リレーへ送信され、タイムラインは全リレーから取得したイベントを重複排除して表示します。</p>
-          </div>
-
-          {msg && <p className="text-sm text-green-400">{msg}</p>}
-          {err && <p className="text-sm text-red-400">{err}</p>}
         </div>
       </LiquidGlass>
 
-      {/* ネットワークモード設定。fsec 保有ユーザー(fodpr)のみ表示 */}
+      {/* F2F メッシュ (P2P)。fsec 保有ユーザーのみ表示 */}
       {!!secretHex && (
         <LiquidGlass intensity="subtle" refractive={false} className="liquid-glass--card w-full">
           <div className="space-y-3 p-4">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm font-medium text-white">ネットワークモード</p>
-                <p className="mt-0.5 text-xs text-gray-400">P2P 接続方式を選択します</p>
+                <p className="text-sm font-medium text-white">ネットワーク (P2P メッシュ)</p>
+                <p className="mt-0.5 text-xs text-gray-400">F2F メッシュへ自動接続します (招待コード / ブートストラップノード)</p>
               </div>
             </div>
+            <div className="space-y-2">
+              <div className="flex items-center justify-between rounded-xl bg-black/30 px-3 py-2">
+                <span className="min-w-0 flex-1 truncate text-xs text-gray-300">
+                  接続中ピア: {networkPeerCount} 台
+                </span>
+                <span className={"h-2 w-2 shrink-0 rounded-full " + (meshConnected ? "bg-green-400" : "bg-red-400")} />
+              </div>
+              {networkSeedNodes.map((p) => (
+                <div key={p.pubkey} className="flex items-center gap-2 rounded-xl bg-black/30 px-3 py-1.5">
+                  <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-gray-400">
+                    {p.pubkey.slice(0, 16)}…
+                  </span>
+                  <span className="shrink-0 text-[10px] text-gray-500">信頼 {p.trustScore.toFixed(2)}</span>
+                </div>
+              ))}
+            </div>
 
-            <div className="space-y-2 border-t border-white/10 pt-3">
-              <div className="flex flex-wrap gap-2">
-                {(['f2f', 'rtcgroup', 'relay'] as NetworkMode[]).map((mode) => (
-                  <button
-                    key={mode}
-                    onClick={() => onSetNetworkMode(mode)}
-                    className={
-                      'shrink-0 rounded-xl border px-4 py-2 text-sm font-semibold transition-colors ' +
-                      (networkMode === mode
-                        ? 'border-primary bg-primary/10 text-primary'
-                        : 'border-white/15 text-gray-300 hover:bg-white/10')
-                    }
-                  >
-                    {mode === 'f2f' && 'F2F (WoT)'}
-                    {mode === 'rtcgroup' && 'RtcGroup (ホスト昇格)'}
-                    {mode === 'relay' && 'リレーのみ'}
-                  </button>
+          {meshTrust.length > 0 && (
+            <div className="space-y-2 pt-2 border-t border-white/10">
+              <label className="block text-xs text-gray-400">WoT 信頼一覧</label>
+              <div className="space-y-1">
+                {meshTrust.slice(0, 20).map((t) => (
+                  <div key={t.pubkey} className="flex items-center justify-between rounded-xl bg-black/30 px-3 py-1.5">
+                    <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-gray-400">
+                      {t.pubkey.slice(0, 16)}…
+                    </span>
+                    <span className="shrink-0 text-[10px] text-gray-500">
+                      スコア {t.score.toFixed(2)}
+                      {t.introducedBy ? ` (紹介: ${t.introducedBy.slice(0, 8)}…)` : ""}
+                    </span>
+                  </div>
                 ))}
               </div>
+            </div>
+          )}
 
-              <p className="text-xs text-gray-400">
-                {networkMode === 'f2f' && 'Web of Trust 方式。知り合いを介して最大50人まで接続し、招待コードまたはリレーシードでブートストラップ。'}
-                {networkMode === 'rtcgroup' && 'ホスト昇格型。最初の接続者がホストとなり、ホスト離脱時に最古参加者が昇格。'}
-                {networkMode === 'relay' && 'リレーサーバー経由のみ。P2P 接続を行いません。'}
-              </p>
-
-              {networkMode === 'f2f' && (
-                <div className="space-y-2.5 border-t border-white/10 pt-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs text-gray-400">接続ピア数</span>
-                    <span className="text-sm font-semibold text-white">{networkPeerCount}</span>
+          {meshDhtNodes.length > 0 && (
+            <div className="space-y-2 pt-2 border-t border-white/10">
+              <label className="block text-xs text-gray-400">DHT ノード ({meshDhtNodes.length})</label>
+              <div className="space-y-1">
+                {meshDhtNodes.slice(0, 20).map((n) => (
+                  <div key={n.pubkey} className="flex items-center justify-between rounded-xl bg-black/30 px-3 py-1.5">
+                    <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-gray-400">
+                      {n.pubkey.slice(0, 16)}…
+                    </span>
+                    <span className="shrink-0 text-[10px] text-gray-500">
+                      {n.addresses.length > 0 ? n.addresses[0] : "アドレス不明"}
+                    </span>
                   </div>
+                ))}
+              </div>
+            </div>
+          )}
 
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs text-gray-400">キャッシュピア数</span>
-                    <span className="text-sm font-semibold text-white">{networkSeedNodes.length}</span>
-                  </div>
-
-                  <div className="space-y-2 pt-2 border-t border-white/10">
-                      <div className="space-y-2">
-                        <p className="text-xs font-medium text-gray-300">招待コードで接続</p>
-                        <div className="flex gap-2">
-                          <input
-                            type="text"
-                            placeholder="招待コード (f2finv1...)"
-                            className="flex-1 rounded-xl bg-black/30 border border-white/15 px-3 py-2 text-xs text-white placeholder-gray-500"
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') {
-                                const code = e.currentTarget.value.trim();
-                                if (code) {
-                                  e.currentTarget.value = '';
-                                  onNetworkConnectInvitation(code);
-                                }
-                              }
-                            }}
-                          />
-                          <button
-                            onClick={() => {
-                              const code = prompt('招待コードを入力してください (f2finv1...)');
-                              if (code?.trim()) onNetworkConnectInvitation(code.trim());
-                            }}
-                            className="shrink-0 rounded-xl border border-white/15 px-3 py-2 text-xs font-semibold text-gray-300 transition-colors hover:bg-white/10"
-                          >
-                            接続
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="space-y-2 pt-2 border-t border-white/10">
-                        <div className="flex items-center gap-2">
-                          <p className="text-xs font-medium text-gray-300 shrink-0 w-36">招待コード発行</p>
-                          <button
-                            onClick={async () => {
-                              await onNetworkCreateInvitation();
-                            }}
-                            className="shrink-0 rounded-xl bg-primary px-3 py-2 text-xs font-semibold text-bg transition-colors hover:bg-primary-hover"
-                          >
-                            発行
-                          </button>
-                          {invitationCode && (
-                            <>
-                              <input
-                                type="text"
-                                value={invitationCode}
-                                readOnly
-                                className="flex-1 rounded-xl bg-black/30 border border-white/15 px-3 py-2 text-xs text-white font-mono select-all"
-                              />
-                              <button
-                                onClick={async () => {
-                                  await navigator.clipboard.writeText(invitationCode);
-                                  setMsg?.('招待コードをコピーしました');
-                                  setTimeout(() => setMsg?.(null), 2000);
-                                }}
-                                className="shrink-0 rounded-xl border border-white/15 px-3 py-2 text-xs font-semibold text-gray-300 transition-colors hover:bg-white/10"
-                              >
-                                コピー
-                              </button>
-                            </>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-
-                    {networkLastError && <p className="text-xs text-red-400">{networkLastError}</p>}
-
-                  <div className="flex flex-wrap gap-2 pt-1">
-                    <button
-                      onClick={onNetworkBootstrap}
-                      className="rounded-xl border border-white/15 px-3 py-1.5 text-xs font-semibold text-gray-300 transition-colors hover:bg-white/10"
-                    >
-                      {networkBootstrapDone ? '再取得' : 'シード取得'}
-                    </button>
-                  </div>
-
-                  {networkSeedNodes.length > 0 && (
-                    <div className="space-y-1">
-                      <p className="text-xs text-gray-400">シードから取得したピア候補</p>
-                      {networkSeedNodes.slice(0, 5).map((p) => (
-                        <div key={p.pubkey} className="flex items-center gap-2 rounded-xl bg-black/30 px-3 py-1.5">
-                          <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-gray-400">
-                            {p.pubkey.slice(0, 16)}…
-                          </span>
-                          <span className="shrink-0 text-[10px] text-gray-500">信頼 {p.trustScore.toFixed(2)}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
+          <div className="space-y-2 pt-2 border-t border-white/10">
+            <label className="block text-xs text-gray-400">ブートストラップノード (fpub1@[ipv6]:port)</label>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                placeholder="fpub1@[::1]:443"
+                value={bootstrapInput}
+                onChange={(e) => setBootstrapInput(e.target.value)}
+                className="min-w-0 flex-1 rounded-xl bg-black/30 px-3 py-2 text-xs text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-white/25"
+              />
+              <button
+                onClick={addBootstrapNode}
+                className="shrink-0 rounded-xl bg-primary px-3 py-1.5 text-xs font-semibold text-bg transition-colors hover:bg-primary-hover"
+              >
+                追加
+              </button>
+            </div>
+            <div className="space-y-1">
+              {loadBootstrapNodes().map((u) => (
+                <div key={u} className="flex items-center justify-between rounded-xl bg-black/30 px-3 py-1.5">
+                  <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-gray-400">{u.slice(0, 40)}…</span>
+                  <button
+                    onClick={() => removeBootstrapNode(u)}
+                    className="shrink-0 rounded-lg border border-white/15 px-2 py-0.5 text-[10px] text-gray-400 transition-colors hover:bg-white/10"
+                  >
+                    削除
+                  </button>
                 </div>
-              )}
+              ))}
+              {loadBootstrapNodes().length === 0 && <p className="text-[10px] text-gray-500">未登録</p>}
+            </div>
+          </div>
 
-              {networkMode === 'rtcgroup' && (
-                <div className="space-y-2.5 border-t border-white/10 pt-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs text-gray-400">接続ピア数</span>
-                    <span className="text-sm font-semibold text-white">{networkPeerCount}</span>
-                  </div>
-
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs text-gray-400">参加グループ数</span>
-                    <span className="text-sm font-semibold text-white">{networkGroups.length}</span>
-                  </div>
-
-                  {networkGroups.length > 0 && (
-                    <div className="space-y-1.5">
-                      {networkGroups.map((g) => (
-                        <div key={g.groupId} className="rounded-xl bg-black/30 px-3 py-2">
-                          <div className="flex items-center justify-between">
-                            <span className="min-w-0 truncate text-xs text-gray-300">
-                              {g.groupId.slice(0, 16)}… ({g.members.length}人)
-                            </span>
-                            <span
-                              className={
-                                'shrink-0 rounded-full px-2 py-0.5 text-[10px] ' +
-                                (g.isHost ? 'bg-primary/20 text-primary' : 'bg-white/10 text-gray-300')
-                              }
-                            >
-                              {g.isHost ? 'ホスト' : 'ゲスト'}
-                            </span>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  {networkLastError && <p className="text-xs text-red-400">{networkLastError}</p>}
-
-                  <div className="flex flex-wrap gap-2 pt-1">
-                    <button
-                      onClick={onNetworkCreateGroup}
-                      className="rounded-xl bg-primary px-3 py-1.5 text-xs font-semibold text-bg transition-colors hover:bg-primary-hover"
-                    >
-                      グループ作成 (ホストになる)
-                    </button>
-                    <button
-                      onClick={() => {
-                        const groupId = prompt('ホストの fpub を入力してください');
-                        if (groupId) onNetworkJoinGroup(groupId.trim());
-                      }}
-                      className="rounded-xl border border-white/15 px-3 py-1.5 text-xs font-semibold text-gray-300 transition-colors hover:bg-white/10"
-                    >
-                      グループ参加 (ホスト fpub 指定)
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {networkMode === 'relay' && (
-                <div className="space-y-2.5 border-t border-white/10 pt-3">
-                  <p className="text-xs text-gray-400">リレーサーバー経由でメッセージを送受信します。P2P 接続は行いません。</p>
-                </div>
+          <div className="space-y-2 pt-2 border-t border-white/10">
+            <div className="flex items-center gap-2">
+              <p className="text-xs font-medium text-gray-300 shrink-0 w-40">招待コードで接続</p>
+              <input
+                type="text"
+                placeholder="招待コード (f2finv1...)"
+                className="flex-1 rounded-xl bg-black/30 border border-white/15 px-3 py-2 text-xs text-white placeholder-gray-500"
+                value={invitationInput}
+                onChange={(e) => setInvitationInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && invitationInput.trim()) {
+                    onNetworkConnectInvitation(invitationInput.trim());
+                    setInvitationInput("");
+                  }
+                }}
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <p className="text-xs font-medium text-gray-300 shrink-0 w-40">招待コード発行</p>
+              <button
+                onClick={async () => {
+                  await onNetworkCreateInvitation();
+                }}
+                className="shrink-0 rounded-xl bg-primary px-3 py-1.5 text-xs font-semibold text-bg transition-colors hover:bg-primary-hover"
+              >
+                発行
+              </button>
+              {invitationCode && (
+                <>
+                  <input
+                    type="text"
+                    value={invitationCode}
+                    readOnly
+                    className="flex-1 rounded-xl bg-black/30 border border-white/15 px-3 py-1.5 text-xs text-white font-mono select-all"
+                  />
+                  <button
+                    onClick={async () => {
+                      await navigator.clipboard.writeText(invitationCode);
+                      setMsg("招待コードをコピーしました");
+                      setTimeout(() => setMsg(null), 2000);
+                    }}
+                    className="shrink-0 rounded-xl border border-white/15 px-2 py-1 text-xs font-semibold text-gray-300 transition-colors hover:bg-white/10"
+                  >
+                    コピー
+                  </button>
+                </>
               )}
             </div>
+          </div>
+
+          <div className="flex flex-wrap gap-2 pt-1">
+            <button
+              onClick={onNetworkBootstrap}
+              className="rounded-xl border border-white/15 px-3 py-1.5 text-xs font-semibold text-gray-300 transition-colors hover:bg-white/10"
+            >
+              {networkBootstrapDone ? "再取得" : "シード取得"}
+            </button>
+          </div>
+
+          {networkLastError && <p className="text-xs text-red-400">{networkLastError}</p>}
+          {msg && <p className="text-sm text-green-400">{msg}</p>}
+          {err && <p className="text-sm text-red-400">{err}</p>}
           </div>
         </LiquidGlass>
       )}

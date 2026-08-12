@@ -25,9 +25,9 @@
   },
   "dependencies": {
     "@dpawlikowski/liquid-glass": "^0.3.0",
+    "fodpr-ts-sdk": "file:../FodprTSSDK",
     "nosskey-sdk": "^0.2.0",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8",
-    "ws": "^8.21.2"
+    "react-dom": "^19.2.8"
   }
 }
